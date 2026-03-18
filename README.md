@@ -1,6 +1,8 @@
-# Emby 反向代理 + 管理面板
+# CF-WORKER-Emby-UI
 
 一个功能完整的 Emby 反向代理系统，基于 Cloudflare Workers 构建，包含可视化仪表盘和管理后台。
+
+[![GitHub](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/wzlinbin/CF-WORKER-Emby-UI)
 
 ## ✨ 功能特性
 
