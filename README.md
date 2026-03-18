@@ -2,6 +2,10 @@
 
 一个功能完整的 Emby 反向代理系统，基于 Cloudflare Workers 构建，包含可视化仪表盘和管理后台。
 
+
+<img width="1280" height="1102" alt="image" src="https://github.com/user-attachments/assets/3164ad61-606a-4453-a12c-7b4d74b4c0b1" />
+
+
 ## ✨ 功能特性
 
 ### 🔄 反向代理
