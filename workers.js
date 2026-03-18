@@ -41,6 +41,7 @@ function generateToken() {
 
 // 验证管理员会话
 async function verifySession(request, env) {
+    if (!env || !env.EMBY_KV) return false;
     const authHeader = request.headers.get('Authorization');
     if (authHeader && authHeader.startsWith('Bearer ')) {
         const token = authHeader.substring(7);
@@ -65,6 +66,7 @@ function getClientIP(request) {
 
 // 检查IP是否在黑名单/白名单中
 async function checkIPAccess(clientIP, env) {
+    if (!env || !env.EMBY_KV) return true;
     const blacklist = await env.EMBY_KV.get('config:blacklist', { type: 'json' }) || [];
     const whitelist = await env.EMBY_KV.get('config:whitelist', { type: 'json' });
     
@@ -79,17 +81,20 @@ async function checkIPAccess(clientIP, env) {
 
 // 获取后端配置
 async function getBackendConfig(env) {
+    if (!env || !env.EMBY_KV) return DEFAULT_BACKENDS;
     const config = await env.EMBY_KV.get('config:backends', { type: 'json' });
     return config || DEFAULT_BACKENDS;
 }
 
 // 保存后端配置
 async function saveBackendConfig(env, config) {
+    if (!env || !env.EMBY_KV) return;
     await env.EMBY_KV.put('config:backends', JSON.stringify(config));
 }
 
 // 记录统计数据
 async function recordStats(env, port, success, bytes, duration) {
+    if (!env || !env.EMBY_KV) return;
     const today = new Date().toISOString().split('T')[0];
     const key = `stats:${today}`;
     
@@ -112,11 +117,12 @@ async function recordStats(env, port, success, bytes, duration) {
     else stats.ports[port].error++;
     stats.ports[port].bytes += bytes;
     
-    await env.EMBY_KV.put(key, JSON.stringify(stats), { expirationTtl: 86400 * 90 }); // 保留90天
+    await env.EMBY_KV.put(key, JSON.stringify(stats), { expirationTtl: 86400 * 90 });
 }
 
 // 记录错误日志
 async function logError(env, port, error, url, clientIP) {
+    if (!env || !env.EMBY_KV) return;
     const key = `logs:errors:${Date.now()}`;
     const log = {
         time: new Date().toISOString(),
@@ -125,11 +131,12 @@ async function logError(env, port, error, url, clientIP) {
         url: url,
         clientIP: clientIP
     };
-    await env.EMBY_KV.put(key, JSON.stringify(log), { expirationTtl: 86400 * 7 }); // 保留7天
+    await env.EMBY_KV.put(key, JSON.stringify(log), { expirationTtl: 86400 * 7 });
 }
 
 // 获取最近错误日志
 async function getRecentErrors(env, limit = 50) {
+    if (!env || !env.EMBY_KV) return [];
     const list = await env.EMBY_KV.list({ prefix: 'logs:errors:', limit: limit });
     const logs = [];
     for (const key of list.keys) {
@@ -141,6 +148,7 @@ async function getRecentErrors(env, limit = 50) {
 
 // 获取统计数据
 async function getStatsSummary(env, days = 7) {
+    if (!env || !env.EMBY_KV) return [];
     const stats = [];
     const today = new Date();
     
@@ -170,7 +178,6 @@ function getAdminHTML() {
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
         .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
         
-        /* 登录页面 */
         .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
         .login-box { background: #16213e; padding: 40px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
         .login-box h1 { text-align: center; margin-bottom: 30px; color: #4ecca3; }
@@ -178,71 +185,62 @@ function getAdminHTML() {
         .login-box button { width: 100%; padding: 15px; border: none; border-radius: 5px; background: #4ecca3; color: #1a1a2e; font-size: 16px; cursor: pointer; font-weight: bold; }
         .login-box button:hover { background: #3db892; }
         
-        /* 主界面 */
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #333; }
         .header h1 { color: #4ecca3; }
         .header button { padding: 10px 20px; border: none; border-radius: 5px; background: #e94560; color: #fff; cursor: pointer; }
         
-        /* 统计卡片 */
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
         .stat-card { background: #16213e; padding: 25px; border-radius: 10px; text-align: center; }
         .stat-card h3 { color: #888; font-size: 14px; margin-bottom: 10px; }
         .stat-card .value { font-size: 32px; font-weight: bold; color: #4ecca3; }
         .stat-card.error .value { color: #e94560; }
         
-        /* 标签页 */
-        .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
         .tab { padding: 12px 24px; background: #16213e; border: none; border-radius: 5px; color: #888; cursor: pointer; font-size: 14px; }
         .tab.active { background: #4ecca3; color: #1a1a2e; font-weight: bold; }
         .tab:hover:not(.active) { background: #1f3460; }
         
-        /* 内容面板 */
         .panel { display: none; background: #16213e; border-radius: 10px; padding: 25px; }
         .panel.active { display: block; }
         
-        /* 表格 */
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 15px; text-align: left; border-bottom: 1px solid #333; }
         th { color: #4ecca3; font-weight: 600; }
         tr:hover { background: rgba(78, 204, 163, 0.05); }
         
-        /* 表单 */
         .form-group { margin-bottom: 20px; }
         .form-group label { display: block; margin-bottom: 8px; color: #888; }
         .form-group input, .form-group select { width: 100%; padding: 12px; border: none; border-radius: 5px; background: #1a1a2e; color: #fff; font-size: 14px; }
         .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
         
-        /* 按钮 */
-        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; }
+        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; margin-bottom: 5px; }
         .btn-primary { background: #4ecca3; color: #1a1a2e; }
         .btn-danger { background: #e94560; color: #fff; }
         .btn-secondary { background: #333; color: #fff; }
         .btn:hover { opacity: 0.9; }
         
-        /* 状态指示 */
         .status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; }
         .status.online { background: #4ecca3; color: #1a1a2e; }
         .status.offline { background: #e94560; color: #fff; }
         
-        /* 图表容器 */
         .chart-container { height: 300px; position: relative; margin-top: 20px; }
-        .bar-chart { display: flex; align-items: flex-end; height: 250px; gap: 5px; padding: 10px 0; }
-        .bar { flex: 1; background: linear-gradient(to top, #4ecca3, #3db892); border-radius: 3px 3px 0 0; min-height: 5px; position: relative; }
+        .bar-chart { display: flex; align-items: flex-end; height: 250px; gap: 5px; padding: 10px 0; overflow-x: auto; }
+        .bar { min-width: 40px; flex: 1; background: linear-gradient(to top, #4ecca3, #3db892); border-radius: 3px 3px 0 0; min-height: 5px; position: relative; }
         .bar:hover { opacity: 0.8; }
         .bar-label { position: absolute; bottom: -25px; left: 50%; transform: translateX(-50%); font-size: 11px; color: #888; white-space: nowrap; }
         .bar-value { position: absolute; top: -20px; left: 50%; transform: translateX(-50%); font-size: 11px; color: #4ecca3; }
         
-        /* 日志 */
         .log-entry { padding: 12px; border-left: 3px solid #e94560; background: rgba(233, 69, 96, 0.1); margin-bottom: 10px; border-radius: 0 5px 5px 0; }
         .log-time { color: #888; font-size: 12px; }
         .log-error { color: #e94560; margin-top: 5px; word-break: break-all; }
         
-        /* IP列表 */
         .ip-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; }
         .ip-item { background: #1a1a2e; padding: 8px 15px; border-radius: 20px; display: flex; align-items: center; gap: 10px; }
         .ip-item button { background: none; border: none; color: #e94560; cursor: pointer; font-size: 18px; }
         
-        /* 响应式 */
+        .alert { padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .alert-warning { background: rgba(233, 69, 96, 0.2); border: 1px solid #e94560; color: #e94560; }
+        
         @media (max-width: 768px) {
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
             .form-row { grid-template-columns: 1fr; }
@@ -252,7 +250,6 @@ function getAdminHTML() {
     </style>
 </head>
 <body>
-    <!-- 登录页面 -->
     <div id="loginPage" class="login-container">
         <div class="login-box">
             <h1>🔐 管理登录</h1>
@@ -262,14 +259,16 @@ function getAdminHTML() {
         </div>
     </div>
     
-    <!-- 主界面 -->
     <div id="mainPage" class="container" style="display: none;">
         <div class="header">
             <h1>🎬 Emby 反代管理面板</h1>
             <button onclick="logout()">退出登录</button>
         </div>
         
-        <!-- 统计卡片 -->
+        <div id="kvWarning" class="alert alert-warning" style="display: none;">
+            ⚠️ KV 未配置，统计和管理功能不可用。请先创建 KV 命名空间并绑定到 Worker。
+        </div>
+        
         <div class="stats-grid">
             <div class="stat-card">
                 <h3>今日请求</h3>
@@ -289,7 +288,6 @@ function getAdminHTML() {
             </div>
         </div>
         
-        <!-- 标签页 -->
         <div class="tabs">
             <button class="tab active" onclick="showPanel('dashboard')">📊 仪表盘</button>
             <button class="tab" onclick="showPanel('backends')">🖥️ 后端管理</button>
@@ -297,7 +295,6 @@ function getAdminHTML() {
             <button class="tab" onclick="showPanel('logs')">📋 错误日志</button>
         </div>
         
-        <!-- 仪表盘面板 -->
         <div id="dashboard" class="panel active">
             <h3 style="margin-bottom: 20px;">近7天请求统计</h3>
             <div class="chart-container">
@@ -320,7 +317,6 @@ function getAdminHTML() {
             </table>
         </div>
         
-        <!-- 后端管理面板 -->
         <div id="backends" class="panel">
             <h3 style="margin-bottom: 20px;">后端服务器配置</h3>
             <table>
@@ -355,7 +351,6 @@ function getAdminHTML() {
             <button class="btn btn-secondary" onclick="resetBackends()">恢复默认</button>
         </div>
         
-        <!-- 访问控制面板 -->
         <div id="access" class="panel">
             <h3 style="margin-bottom: 20px;">访问控制</h3>
             
@@ -380,7 +375,6 @@ function getAdminHTML() {
             <p style="color: #888; margin-top: 20px;">💡 提示：白名单优先级高于黑名单。设置白名单后，只有白名单中的IP可以访问。</p>
         </div>
         
-        <!-- 错误日志面板 -->
         <div id="logs" class="panel">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <h3>最近错误日志</h3>
@@ -392,8 +386,8 @@ function getAdminHTML() {
 
     <script>
         let token = localStorage.getItem('admin_token') || '';
+        let kvAvailable = true;
         
-        // 初始化
         async function init() {
             if (token) {
                 document.getElementById('loginPage').style.display = 'none';
@@ -402,7 +396,6 @@ function getAdminHTML() {
             }
         }
         
-        // 登录
         async function login() {
             const password = document.getElementById('password').value;
             try {
@@ -426,7 +419,6 @@ function getAdminHTML() {
             }
         }
         
-        // 退出登录
         function logout() {
             token = '';
             localStorage.removeItem('admin_token');
@@ -434,7 +426,6 @@ function getAdminHTML() {
             document.getElementById('mainPage').style.display = 'none';
         }
         
-        // 显示面板
         function showPanel(name) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -445,13 +436,17 @@ function getAdminHTML() {
             if (name === 'logs') refreshLogs();
         }
         
-        // 加载仪表盘
         async function loadDashboard() {
             try {
                 const res = await fetch('/admin/api/stats', {
                     headers: { 'Authorization': 'Bearer ' + token }
                 });
                 const data = await res.json();
+                
+                if (data.kvWarning) {
+                    kvAvailable = false;
+                    document.getElementById('kvWarning').style.display = 'block';
+                }
                 
                 if (data.today) {
                     document.getElementById('todayTotal').textContent = data.today.total.toLocaleString();
@@ -461,20 +456,14 @@ function getAdminHTML() {
                     document.getElementById('todayErrors').textContent = data.today.error;
                 }
                 
-                // 绘制图表
                 renderChart(data.history || []);
-                
-                // 端口统计
                 renderPortStats(data.today, data.backends);
-                
-                // 加载后端列表
                 renderBackendList(data.backends);
             } catch (e) {
                 console.error('加载仪表盘失败', e);
             }
         }
         
-        // 格式化字节
         function formatBytes(bytes) {
             if (bytes === 0) return '0 B';
             const k = 1024;
@@ -483,7 +472,6 @@ function getAdminHTML() {
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
         
-        // 渲染图表
         function renderChart(history) {
             const chart = document.getElementById('chart');
             if (!history.length) {
@@ -499,7 +487,6 @@ function getAdminHTML() {
             }).join('');
         }
         
-        // 渲染端口统计
         function renderPortStats(today, backends) {
             const tbody = document.getElementById('portStats');
             const ports = Object.keys(backends || {});
@@ -522,14 +509,13 @@ function getAdminHTML() {
             }).join('');
         }
         
-        // 渲染后端列表
         function renderBackendList(backends) {
             const tbody = document.getElementById('backendList');
             tbody.innerHTML = Object.entries(backends || {}).map(([port, config]) => {
                 return '<tr>' +
                     '<td>' + port + '</td>' +
                     '<td>' + config.name + '</td>' +
-                    '<td>' + config.url + '</td>' +
+                    '<td style="word-break: break-all;">' + config.url + '</td>' +
                     '<td><span class="status ' + (config.enabled ? 'online' : 'offline') + '">' + (config.enabled ? '启用' : '禁用') + '</span></td>' +
                     '<td>' +
                         '<button class="btn btn-primary" onclick="editBackend(\\'' + port + '\\')">编辑</button> ' +
@@ -540,7 +526,6 @@ function getAdminHTML() {
             }).join('');
         }
         
-        // 编辑后端
         function editBackend(port) {
             fetch('/admin/api/backends', {
                 headers: { 'Authorization': 'Bearer ' + token }
@@ -556,7 +541,6 @@ function getAdminHTML() {
             });
         }
         
-        // 保存后端
         async function saveBackend() {
             const port = document.getElementById('backendPort').value.trim();
             const name = document.getElementById('backendName').value.trim();
@@ -591,7 +575,6 @@ function getAdminHTML() {
             }
         }
         
-        // 切换后端状态
         async function toggleBackend(port) {
             try {
                 const res = await fetch('/admin/api/backends/toggle', {
@@ -609,7 +592,6 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
-        // 删除后端
         async function deleteBackend(port) {
             if (!confirm('确定要删除此后端配置吗？')) return;
             try {
@@ -628,7 +610,6 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
-        // 恢复默认后端
         async function resetBackends() {
             if (!confirm('确定要恢复默认配置吗？这将覆盖当前所有后端配置。')) return;
             try {
@@ -644,7 +625,6 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
-        // 加载访问控制
         async function loadAccessControl() {
             try {
                 const res = await fetch('/admin/api/access', {
@@ -657,7 +637,6 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
-        // 渲染IP列表
         function renderIPList(elementId, ips, type) {
             const container = document.getElementById(elementId);
             container.innerHTML = ips.map(ip => 
@@ -668,7 +647,6 @@ function getAdminHTML() {
             ).join('') || '<span style="color: #888;">暂无</span>';
         }
         
-        // 添加黑名单
         async function addBlacklist() {
             const ip = document.getElementById('blacklistIP').value.trim();
             if (!ip) return;
@@ -676,7 +654,6 @@ function getAdminHTML() {
             document.getElementById('blacklistIP').value = '';
         }
         
-        // 添加白名单
         async function addWhitelist() {
             const ip = document.getElementById('whitelistIP').value.trim();
             if (!ip) return;
@@ -684,7 +661,6 @@ function getAdminHTML() {
             document.getElementById('whitelistIP').value = '';
         }
         
-        // 添加IP
         async function addIP(type, ip) {
             try {
                 const res = await fetch('/admin/api/access', {
@@ -702,7 +678,6 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
-        // 删除IP
         async function removeIP(type, ip) {
             try {
                 const res = await fetch('/admin/api/access', {
@@ -720,7 +695,6 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
-        // 刷新日志
         async function refreshLogs() {
             try {
                 const res = await fetch('/admin/api/logs', {
@@ -744,7 +718,6 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
-        // 页面加载完成后初始化
         init();
     </script>
 </body>
@@ -753,12 +726,13 @@ function getAdminHTML() {
 
 // ==================== API 处理函数 ====================
 
-// 处理登录
 async function handleLogin(request, env) {
     const body = await request.json();
     if (body.password === ADMIN_PASSWORD) {
         const token = generateToken();
-        await env.EMBY_KV.put('session:admin', token, { expirationTtl: 86400 }); // 24小时过期
+        if (env && env.EMBY_KV) {
+            await env.EMBY_KV.put('session:admin', token, { expirationTtl: 86400 });
+        }
         return new Response(JSON.stringify({ success: true, token }), {
             headers: { 'Content-Type': 'application/json' }
         });
@@ -769,25 +743,26 @@ async function handleLogin(request, env) {
     });
 }
 
-// 处理统计API
 async function handleStatsAPI(request, env) {
+    const hasKV = env && env.EMBY_KV;
+    
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const today = new Date().toISOString().split('T')[0];
-    const todayStats = await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || { total: 0, success: 0, error: 0, bytes: 0, ports: {} };
-    const history = await getStatsSummary(env, 7);
+    const todayStats = hasKV ? (await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || { total: 0, success: 0, error: 0, bytes: 0, ports: {} }) : { total: 0, success: 0, error: 0, bytes: 0, ports: {} };
+    const history = hasKV ? await getStatsSummary(env, 7) : [];
     const backends = await getBackendConfig(env);
     
     return new Response(JSON.stringify({
         today: todayStats,
         history: history,
-        backends: backends
+        backends: backends,
+        kvWarning: !hasKV
     }), { headers: { 'Content-Type': 'application/json' } });
 }
 
-// 处理后端管理API
 async function handleBackendsAPI(request, env) {
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
@@ -820,7 +795,6 @@ async function handleBackendsAPI(request, env) {
     return new Response(JSON.stringify({ error: '不支持的请求方法' }), { status: 405, headers: { 'Content-Type': 'application/json' } });
 }
 
-// 处理后端状态切换
 async function handleToggleBackendAPI(request, env) {
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
@@ -838,7 +812,6 @@ async function handleToggleBackendAPI(request, env) {
     return new Response(JSON.stringify({ error: '后端不存在' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
 }
 
-// 处理恢复默认配置
 async function handleResetBackendsAPI(request, env) {
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
@@ -848,8 +821,11 @@ async function handleResetBackendsAPI(request, env) {
     return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 }
 
-// 处理访问控制API
 async function handleAccessAPI(request, env) {
+    if (!env || !env.EMBY_KV) {
+        return new Response(JSON.stringify({ blacklist: [], whitelist: [] }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
@@ -878,8 +854,11 @@ async function handleAccessAPI(request, env) {
     return new Response(JSON.stringify({ error: '不支持的请求方法' }), { status: 405, headers: { 'Content-Type': 'application/json' } });
 }
 
-// 处理日志API
 async function handleLogsAPI(request, env) {
+    if (!env || !env.EMBY_KV) {
+        return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
@@ -1000,13 +979,7 @@ async function handleRequest(event) {
     const url = new URL(request.url);
     const env = event.env;
     
-    // 检查 KV 是否绑定
-    if (!env || !env.EMBY_KV) {
-        // 如果没有 KV，使用默认配置运行（无统计功能）
-        return handleProxyWithoutKV(request);
-    }
-    
-    // 管理面板路由
+    // 管理面板路由（优先处理，不受 KV 影响）
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
         return new Response(getAdminHTML(), {
             headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -1042,72 +1015,6 @@ async function handleRequest(event) {
     
     // 代理请求
     return handleProxy(request, env);
-}
-
-// 无 KV 时的简化代理处理
-async function handleProxyWithoutKV(request) {
-    const url = new URL(request.url);
-    
-    const FRONTEND_URL = DEFAULT_BACKENDS.default.url;
-    
-    if (request.method === "OPTIONS") {
-        return new Response(null, {
-            headers: {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Max-Age": "86400",
-            },
-        });
-    }
-    
-    let targetUrlStr;
-    const decodedPath = decodeURIComponent(url.pathname);
-    
-    if (decodedPath.startsWith('/http://') || decodedPath.startsWith('/https://')) {
-        targetUrlStr = decodedPath.substring(1) + url.search;
-    } else {
-        targetUrlStr = FRONTEND_URL + url.pathname + url.search;
-    }
-    
-    const targetUrl = new URL(targetUrlStr);
-    const newHeaders = new Headers(request.headers);
-    newHeaders.set("Host", targetUrl.host);
-    newHeaders.delete("cf-connecting-ip");
-    newHeaders.delete("cf-ipcountry");
-    newHeaders.delete("cf-ray");
-    newHeaders.delete("cf-Visitor");
-    
-    try {
-        const modifiedRequest = new Request(targetUrl, {
-            method: request.method,
-            headers: newHeaders,
-            body: (request.method !== 'GET' && request.method !== 'HEAD') ? await request.clone().arrayBuffer() : null,
-            redirect: 'manual'
-        });
-        
-        const response = await fetch(modifiedRequest);
-        const responseHeaders = new Headers(response.headers);
-        
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-            const location = responseHeaders.get('Location');
-            if (location && (location.startsWith('http://') || location.startsWith('https://'))) {
-                responseHeaders.set('Location', `/${encodeURIComponent(location)}`);
-            }
-        }
-        
-        responseHeaders.set('Access-Control-Allow-Origin', '*');
-        responseHeaders.set('Cache-Control', 'no-store');
-        
-        return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: responseHeaders
-        });
-        
-    } catch (err) {
-        return new Response("Worker Proxy Error: " + err.message, { status: 502 });
-    }
 }
 
 // 事件监听器
