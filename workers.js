@@ -39,22 +39,34 @@ function generateToken() {
         .map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// 内存中存储的token（用于无KV时的会话管理）
+let memoryToken = null;
+
 // 验证管理员会话
 async function verifySession(request, env) {
-    if (!env || !env.EMBY_KV) return false;
     const authHeader = request.headers.get('Authorization');
+    let clientToken = null;
+    
     if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.substring(7);
-        const storedToken = await env.EMBY_KV.get('session:admin');
-        return token === storedToken;
+        clientToken = authHeader.substring(7);
+    } else {
+        const cookie = request.headers.get('Cookie') || '';
+        const match = cookie.match(/admin_token=([^;]+)/);
+        if (match) {
+            clientToken = match[1];
+        }
     }
-    const cookie = request.headers.get('Cookie') || '';
-    const match = cookie.match(/admin_token=([^;]+)/);
-    if (match) {
+    
+    if (!clientToken) return false;
+    
+    // 如果有KV，从KV验证
+    if (env && env.EMBY_KV) {
         const storedToken = await env.EMBY_KV.get('session:admin');
-        return match[1] === storedToken;
+        return clientToken === storedToken;
     }
-    return false;
+    
+    // 没有KV时，使用内存中的token验证
+    return clientToken === memoryToken;
 }
 
 // 获取客户端IP
@@ -732,6 +744,9 @@ async function handleLogin(request, env) {
         const token = generateToken();
         if (env && env.EMBY_KV) {
             await env.EMBY_KV.put('session:admin', token, { expirationTtl: 86400 });
+        } else {
+            // 没有KV时，存储到内存
+            memoryToken = token;
         }
         return new Response(JSON.stringify({ success: true, token }), {
             headers: { 'Content-Type': 'application/json' }
