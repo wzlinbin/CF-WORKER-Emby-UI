@@ -644,7 +644,7 @@ function getAdminHTML() {
                         <pre><code>类型：CNAME
 名称：emby（或其他你想要的子域名）
 目标：saas.sin.fan
-代理状态：已代理（橙色云朵）</code></pre>
+代理状态：仅DNS（必须关闭橙色云朵）</code></pre>
                     </li>
                     <li>点击 <strong>Save</strong> 保存</li>
                 </ul>
