@@ -761,8 +761,25 @@ async function handleLogin(request, env) {
 async function handleStatsAPI(request, env) {
     const hasKV = env && env.EMBY_KV;
     
-    if (!await verifySession(request, env)) {
-        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    // 调试信息
+    const authHeader = request.headers.get('Authorization');
+    const cookie = request.headers.get('Cookie') || '';
+    const cookieMatch = cookie.match(/admin_token=([^;]+)/);
+    
+    // 验证会话
+    const sessionValid = await verifySession(request, env);
+    
+    if (!sessionValid) {
+        return new Response(JSON.stringify({ 
+            error: '未授权', 
+            debug: {
+                hasKV: hasKV,
+                hasAuthHeader: !!authHeader,
+                hasCookieToken: !!cookieMatch,
+                kvToken: hasKV ? (await env.EMBY_KV.get('session:admin')) : 'no kv',
+                memoryToken: memoryToken
+            }
+        }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const today = new Date().toISOString().split('T')[0];
