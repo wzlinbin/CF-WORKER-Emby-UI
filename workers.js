@@ -42,6 +42,16 @@ function generateToken() {
 // 内存中存储的token（用于无KV时的会话管理）
 let memoryToken = null;
 
+// 内存中的统计缓存（减少KV写入频率）
+let statsCache = {
+    date: '',
+    data: { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} },
+    lastSave: 0
+};
+
+// 统计写入间隔（毫秒）- 每30秒写入一次KV
+const STATS_SAVE_INTERVAL = 30000;
+
 // 验证管理员会话
 async function verifySession(request, env) {
     const authHeader = request.headers.get('Authorization');
@@ -104,46 +114,87 @@ async function saveBackendConfig(env, config) {
     await env.EMBY_KV.put('config:backends', JSON.stringify(config));
 }
 
-// 记录统计数据
+// 记录统计数据（使用内存缓存，减少KV写入）
 async function recordStats(env, port, success, bytes, duration) {
     if (!env || !env.EMBY_KV) return;
+    
     const today = new Date().toISOString().split('T')[0];
-    const key = `stats:${today}`;
+    const now = Date.now();
     
-    let stats = await env.EMBY_KV.get(key, { type: 'json' }) || {
-        total: 0, success: 0, error: 0, bytes: 0, duration: 0,
-        ports: {}
-    };
-    
-    stats.total++;
-    if (success) stats.success++;
-    else stats.error++;
-    stats.bytes += bytes;
-    stats.duration += duration;
-    
-    if (!stats.ports[port]) {
-        stats.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
+    // 如果是新的一天，重置缓存
+    if (statsCache.date !== today) {
+        statsCache.date = today;
+        statsCache.data = { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
+        statsCache.lastSave = 0;
     }
-    stats.ports[port].total++;
-    if (success) stats.ports[port].success++;
-    else stats.ports[port].error++;
-    stats.ports[port].bytes += bytes;
     
-    await env.EMBY_KV.put(key, JSON.stringify(stats), { expirationTtl: 86400 * 90 });
+    // 更新内存中的统计数据
+    statsCache.data.total++;
+    if (success) statsCache.data.success++;
+    else statsCache.data.error++;
+    statsCache.data.bytes += bytes;
+    statsCache.data.duration += duration;
+    
+    if (!statsCache.data.ports[port]) {
+        statsCache.data.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
+    }
+    statsCache.data.ports[port].total++;
+    if (success) statsCache.data.ports[port].success++;
+    else statsCache.data.ports[port].error++;
+    statsCache.data.ports[port].bytes += bytes;
+    
+    // 每30秒写入一次KV，或者首次请求时写入
+    if (now - statsCache.lastSave >= STATS_SAVE_INTERVAL || statsCache.lastSave === 0) {
+        statsCache.lastSave = now;
+        try {
+            const key = `stats:${today}`;
+            await env.EMBY_KV.put(key, JSON.stringify(statsCache.data), { expirationTtl: 86400 * 90 });
+        } catch (e) {
+            // KV写入失败时忽略，不影响代理功能
+            console.error('KV write error:', e.message);
+        }
+    }
 }
 
-// 记录错误日志
+// 错误日志缓存
+let errorLogCache = [];
+let lastErrorLogSave = 0;
+const ERROR_LOG_SAVE_INTERVAL = 60000; // 每60秒写入一次
+
+// 记录错误日志（使用缓存，减少KV写入）
 async function logError(env, port, error, url, clientIP) {
     if (!env || !env.EMBY_KV) return;
-    const key = `logs:errors:${Date.now()}`;
-    const log = {
+    
+    const now = Date.now();
+    
+    // 添加到缓存
+    errorLogCache.push({
         time: new Date().toISOString(),
         port: port,
         error: error,
         url: url,
         clientIP: clientIP
-    };
-    await env.EMBY_KV.put(key, JSON.stringify(log), { expirationTtl: 86400 * 7 });
+    });
+    
+    // 只保留最近50条错误
+    if (errorLogCache.length > 50) {
+        errorLogCache = errorLogCache.slice(-50);
+    }
+    
+    // 每60秒写入一次KV
+    if (now - lastErrorLogSave >= ERROR_LOG_SAVE_INTERVAL) {
+        lastErrorLogSave = now;
+        try {
+            // 只保存最新的错误
+            const recentErrors = errorLogCache.slice(-10);
+            for (let i = 0; i < recentErrors.length; i++) {
+                const key = `logs:errors:${now + i}`;
+                await env.EMBY_KV.put(key, JSON.stringify(recentErrors[i]), { expirationTtl: 86400 * 7 });
+            }
+        } catch (e) {
+            console.error('KV write error:', e.message);
+        }
+    }
 }
 
 // 获取最近错误日志
