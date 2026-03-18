@@ -524,6 +524,10 @@ function getAdminHTML() {
         function renderBackendList(backends) {
             const tbody = document.getElementById('backendList');
             tbody.innerHTML = Object.entries(backends || {}).map(([port, config]) => {
+                // 生成反代地址
+                const proxyUrl = port === 'default' 
+                    ? window.location.origin 
+                    : window.location.origin.replace(/(:\\d+)?$/, ':' + port);
                 return '<tr>' +
                     '<td>' + port + '</td>' +
                     '<td>' + config.name + '</td>' +
@@ -532,10 +536,24 @@ function getAdminHTML() {
                     '<td>' +
                         '<button class="btn btn-primary" onclick="editBackend(\\'' + port + '\\')">编辑</button> ' +
                         '<button class="btn ' + (config.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleBackend(\\'' + port + '\\')">' + (config.enabled ? '禁用' : '启用') + '</button> ' +
+                        '<button class="btn btn-secondary" onclick="copyProxyUrl(\\'' + proxyUrl + '\\')">复制地址</button> ' +
                         '<button class="btn btn-danger" onclick="deleteBackend(\\'' + port + '\\')">删除</button>' +
                     '</td>' +
                     '</tr>';
             }).join('');
+        }
+        
+        function copyProxyUrl(url) {
+            navigator.clipboard.writeText(url).then(() => {
+                // 显示复制成功提示
+                const toast = document.createElement('div');
+                toast.textContent = '已复制: ' + url;
+                toast.style.cssText = 'position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #4ecca3; color: #1a1a2e; padding: 12px 24px; border-radius: 5px; font-weight: bold; z-index: 9999;';
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 2000);
+            }).catch(() => {
+                alert('复制失败，请手动复制: ' + url);
+            });
         }
         
         function editBackend(port) {
