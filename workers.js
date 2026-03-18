@@ -760,26 +760,9 @@ async function handleLogin(request, env) {
 
 async function handleStatsAPI(request, env) {
     const hasKV = env && env.EMBY_KV;
-    
-    // 调试信息
-    const authHeader = request.headers.get('Authorization');
-    const cookie = request.headers.get('Cookie') || '';
-    const cookieMatch = cookie.match(/admin_token=([^;]+)/);
-    
-    // 验证会话
-    const sessionValid = await verifySession(request, env);
-    
-    if (!sessionValid) {
-        return new Response(JSON.stringify({ 
-            error: '未授权', 
-            debug: {
-                hasKV: hasKV,
-                hasAuthHeader: !!authHeader,
-                hasCookieToken: !!cookieMatch,
-                kvToken: hasKV ? (await env.EMBY_KV.get('session:admin')) : 'no kv',
-                memoryToken: memoryToken
-            }
-        }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+
+    if (!await verifySession(request, env)) {
+        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const today = new Date().toISOString().split('T')[0];
@@ -1006,10 +989,8 @@ async function handleProxy(request, env) {
 
 // ==================== 主入口 ====================
 
-async function handleRequest(event) {
-    const request = event.request;
+async function handleRequest(request, env) {
     const url = new URL(request.url);
-    const env = event.env;
     
     // 管理面板路由（优先处理，不受 KV 影响）
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
@@ -1049,7 +1030,9 @@ async function handleRequest(event) {
     return handleProxy(request, env);
 }
 
-// 事件监听器
-addEventListener("fetch", event => {
-    event.respondWith(handleRequest(event));
-});
+// 事件监听器 - ES Modules 格式
+export default {
+    async fetch(request, env, ctx) {
+        return handleRequest(request, env);
+    }
+};
