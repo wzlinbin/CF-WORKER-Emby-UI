@@ -3,8 +3,8 @@
 // Cloudflare Worker 版本
 // ============================================
 
-// ==================== 配置区 ====================
-// 管理员密码（建议通过环境变量设置：wrangler.toml 或 Cloudflare Dashboard）
+// ==================== 配置�?====================
+// 管理员密码（建议通过环境变量设置：wrangler.toml �?Cloudflare Dashboard�?
 const ADMIN_PASSWORD = "admin123"; // 请修改为强密码！
 
 // KV 命名空间绑定（需要在 wrangler.toml 中配置）
@@ -39,20 +39,20 @@ function generateToken() {
         .map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 内存中存储的token（用于无KV时的会话管理）
+// 内存中存储的token（用于无KV时的会话管理�?
 let memoryToken = null;
 
-// 内存中的统计缓存（减少KV写入频率）
+// 内存中的统计缓存（减少KV写入频率�?
 let statsCache = {
     date: '',
     data: { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} },
     lastSave: 0
 };
 
-// 统计写入间隔（毫秒）- 每30秒写入一次KV
+// 统计写入间隔（毫秒）- �?0秒写入一次KV
 const STATS_SAVE_INTERVAL = 30000;
 
-// 验证管理员会话
+// 验证管理员会�?
 async function verifySession(request, env) {
     const authHeader = request.headers.get('Authorization');
     let clientToken = null;
@@ -114,7 +114,7 @@ async function saveBackendConfig(env, config) {
     await env.EMBY_KV.put('config:backends', JSON.stringify(config));
 }
 
-// 记录统计数据（使用内存缓存，减少KV写入）
+// 记录统计数据（使用内存缓存，减少KV写入�?
 async function recordStats(env, port, success, bytes, duration) {
     if (!env || !env.EMBY_KV) return;
     
@@ -143,14 +143,14 @@ async function recordStats(env, port, success, bytes, duration) {
     else statsCache.data.ports[port].error++;
     statsCache.data.ports[port].bytes += bytes;
     
-    // 每30秒写入一次KV，或者首次请求时写入
+    // �?0秒写入一次KV，或者首次请求时写入
     if (now - statsCache.lastSave >= STATS_SAVE_INTERVAL || statsCache.lastSave === 0) {
         statsCache.lastSave = now;
         try {
             const key = `stats:${today}`;
             await env.EMBY_KV.put(key, JSON.stringify(statsCache.data), { expirationTtl: 86400 * 90 });
         } catch (e) {
-            // KV写入失败时忽略，不影响代理功能
+            // KV写入失败时忽略，不影响代理功�?
             console.error('KV write error:', e.message);
         }
     }
@@ -159,15 +159,15 @@ async function recordStats(env, port, success, bytes, duration) {
 // 错误日志缓存
 let errorLogCache = [];
 let lastErrorLogSave = 0;
-const ERROR_LOG_SAVE_INTERVAL = 60000; // 每60秒写入一次
+const ERROR_LOG_SAVE_INTERVAL = 60000; // �?0秒写入一�?
 
-// 记录错误日志（使用缓存，减少KV写入）
+// 记录错误日志（使用缓存，减少KV写入�?
 async function logError(env, port, error, url, clientIP) {
     if (!env || !env.EMBY_KV) return;
     
     const now = Date.now();
     
-    // 添加到缓存
+    // 添加到缓�?
     errorLogCache.push({
         time: new Date().toISOString(),
         port: port,
@@ -176,12 +176,12 @@ async function logError(env, port, error, url, clientIP) {
         clientIP: clientIP
     });
     
-    // 只保留最近50条错误
+    // 只保留最�?0条错�?
     if (errorLogCache.length > 50) {
         errorLogCache = errorLogCache.slice(-50);
     }
     
-    // 每60秒写入一次KV
+    // �?0秒写入一次KV
     if (now - lastErrorLogSave >= ERROR_LOG_SAVE_INTERVAL) {
         lastErrorLogSave = now;
         try {
@@ -197,7 +197,7 @@ async function logError(env, port, error, url, clientIP) {
     }
 }
 
-// 获取最近错误日志
+// 获取最近错误日�?
 async function getRecentErrors(env, limit = 50) {
     if (!env || !env.EMBY_KV) return [];
     const list = await env.EMBY_KV.list({ prefix: 'logs:errors:', limit: limit });
@@ -240,70 +240,103 @@ function getAdminHTML() {
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
         .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-        
+
         .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
         .login-box { background: #16213e; padding: 40px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
         .login-box h1 { text-align: center; margin-bottom: 30px; color: #4ecca3; }
         .login-box input { width: 100%; padding: 15px; margin: 10px 0; border: none; border-radius: 5px; background: #1a1a2e; color: #fff; font-size: 16px; }
         .login-box button { width: 100%; padding: 15px; border: none; border-radius: 5px; background: #4ecca3; color: #1a1a2e; font-size: 16px; cursor: pointer; font-weight: bold; }
         .login-box button:hover { background: #3db892; }
-        
+
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #333; }
         .header h1 { color: #4ecca3; }
         .header button { padding: 10px 20px; border: none; border-radius: 5px; background: #e94560; color: #fff; cursor: pointer; }
-        
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: #16213e; padding: 25px; border-radius: 10px; text-align: center; }
-        .stat-card h3 { color: #888; font-size: 14px; margin-bottom: 10px; }
-        .stat-card .value { font-size: 32px; font-weight: bold; color: #4ecca3; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #16213e; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-card h3 { color: #888; font-size: 13px; margin-bottom: 8px; }
+        .stat-card .value { font-size: 28px; font-weight: bold; color: #4ecca3; }
         .stat-card.error .value { color: #e94560; }
-        
+        .stat-card.warning .value { color: #f0a500; }
+
         .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
         .tab { padding: 12px 24px; background: #16213e; border: none; border-radius: 5px; color: #888; cursor: pointer; font-size: 14px; }
         .tab.active { background: #4ecca3; color: #1a1a2e; font-weight: bold; }
         .tab:hover:not(.active) { background: #1f3460; }
-        
+
         .panel { display: none; background: #16213e; border-radius: 10px; padding: 25px; }
         .panel.active { display: block; }
-        
+
+        .section { margin-bottom: 30px; }
+        .section-title { font-size: 16px; color: #4ecca3; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #333; }
+
+        .chart-row { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+        @media (max-width: 900px) { .chart-row { grid-template-columns: 1fr; } }
+
+        .chart-box { background: #1a1a2e; border-radius: 8px; padding: 20px; }
+        .chart-box h4 { color: #888; font-size: 14px; margin-bottom: 15px; }
+
+        /* 新图表样�?*/
+        .line-chart { height: 200px; position: relative; padding: 10px 0 40px 50px; }
+        .line-chart svg { width: 100%; height: 100%; }
+        .chart-grid { stroke: #333; stroke-width: 1; }
+        .chart-line { fill: none; stroke: #4ecca3; stroke-width: 2; }
+        .chart-area { fill: url(#gradient); opacity: 0.3; }
+        .chart-dot { fill: #4ecca3; cursor: pointer; }
+        .chart-dot:hover { r: 6; }
+        .chart-label { font-size: 11px; fill: #888; }
+        .chart-value { font-size: 10px; fill: #4ecca3; }
+
+        /* 饼图样式 */
+        .pie-chart { display: flex; align-items: center; justify-content: center; gap: 20px; }
+        .pie-chart svg { width: 120px; height: 120px; }
+        .pie-legend { font-size: 12px; }
+        .pie-legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .pie-legend-color { width: 12px; height: 12px; border-radius: 2px; }
+
+        /* 分析卡片 */
+        .analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; }
+        .analysis-card { background: #1a1a2e; border-radius: 8px; padding: 15px; }
+        .analysis-card h4 { color: #888; font-size: 12px; margin-bottom: 10px; text-transform: uppercase; }
+        .analysis-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333; }
+        .analysis-item:last-child { border-bottom: none; }
+        .analysis-label { color: #aaa; }
+        .analysis-value { color: #4ecca3; font-weight: bold; }
+
         table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 15px; text-align: left; border-bottom: 1px solid #333; }
-        th { color: #4ecca3; font-weight: 600; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #333; }
+        th { color: #4ecca3; font-weight: 600; font-size: 13px; }
         tr:hover { background: rgba(78, 204, 163, 0.05); }
-        
+
         .form-group { margin-bottom: 20px; }
         .form-group label { display: block; margin-bottom: 8px; color: #888; }
         .form-group input, .form-group select { width: 100%; padding: 12px; border: none; border-radius: 5px; background: #1a1a2e; color: #fff; font-size: 14px; }
         .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
-        
+
         .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; margin-bottom: 5px; }
         .btn-primary { background: #4ecca3; color: #1a1a2e; }
         .btn-danger { background: #e94560; color: #fff; }
         .btn-secondary { background: #333; color: #fff; }
         .btn:hover { opacity: 0.9; }
-        
+
         .status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; }
         .status.online { background: #4ecca3; color: #1a1a2e; }
         .status.offline { background: #e94560; color: #fff; }
-        
-        .chart-container { height: 300px; position: relative; margin-top: 20px; }
-        .bar-chart { display: flex; align-items: flex-end; height: 250px; gap: 5px; padding: 10px 0; overflow-x: auto; }
-        .bar { min-width: 40px; flex: 1; background: linear-gradient(to top, #4ecca3, #3db892); border-radius: 3px 3px 0 0; min-height: 5px; position: relative; }
-        .bar:hover { opacity: 0.8; }
-        .bar-label { position: absolute; bottom: -25px; left: 50%; transform: translateX(-50%); font-size: 11px; color: #888; white-space: nowrap; }
-        .bar-value { position: absolute; top: -20px; left: 50%; transform: translateX(-50%); font-size: 11px; color: #4ecca3; }
-        
+
         .log-entry { padding: 12px; border-left: 3px solid #e94560; background: rgba(233, 69, 96, 0.1); margin-bottom: 10px; border-radius: 0 5px 5px 0; }
         .log-time { color: #888; font-size: 12px; }
         .log-error { color: #e94560; margin-top: 5px; word-break: break-all; }
-        
+
         .ip-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; }
         .ip-item { background: #1a1a2e; padding: 8px 15px; border-radius: 20px; display: flex; align-items: center; gap: 10px; }
         .ip-item button { background: none; border: none; color: #e94560; cursor: pointer; font-size: 18px; }
-        
+
         .alert { padding: 15px; border-radius: 5px; margin-bottom: 20px; }
         .alert-warning { background: rgba(233, 69, 96, 0.2); border: 1px solid #e94560; color: #e94560; }
-        
+
+        .progress-bar { height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-top: 5px; }
+        .progress-fill { height: 100%; background: #4ecca3; border-radius: 4px; transition: width 0.3s; }
+
         @media (max-width: 768px) {
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
             .form-row { grid-template-columns: 1fr; }
@@ -317,28 +350,28 @@ function getAdminHTML() {
         <div class="login-box">
             <h1>🔐 管理登录</h1>
             <input type="password" id="password" placeholder="请输入管理员密码" onkeypress="if(event.key==='Enter')login()">
-            <button onclick="login()">登 录</button>
+            <button onclick="login()">�?�?/button>
             <p id="loginError" style="color: #e94560; text-align: center; margin-top: 15px;"></p>
         </div>
     </div>
-    
+
     <div id="mainPage" class="container" style="display: none;">
         <div class="header">
             <h1>🎬 Emby 反代管理面板</h1>
-            <button onclick="logout()">退出登录</button>
+            <button onclick="logout()">退出登�?/button>
         </div>
-        
+
         <div id="kvWarning" class="alert alert-warning" style="display: none;">
-            ⚠️ KV 未配置，统计和管理功能不可用。请先创建 KV 命名空间并绑定到 Worker。
+            ⚠️ KV 未配置，统计和管理功能不可用。请先创�?KV 命名空间并绑定到 Worker�?
         </div>
-        
+
         <div class="stats-grid">
             <div class="stat-card">
                 <h3>今日请求</h3>
                 <div class="value" id="todayTotal">-</div>
             </div>
             <div class="stat-card">
-                <h3>成功率</h3>
+                <h3>成功�?/h3>
                 <div class="value" id="successRate">-</div>
             </div>
             <div class="stat-card">
@@ -349,61 +382,163 @@ function getAdminHTML() {
                 <h3>今日错误</h3>
                 <div class="value" id="todayErrors">-</div>
             </div>
+            <div class="stat-card warning">
+                <h3>平均响应</h3>
+                <div class="value" id="avgDuration">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>峰�?QPS</h3>
+                <div class="value" id="peakQps">-</div>
+            </div>
         </div>
-        
+
         <div class="tabs">
-            <button class="tab active" onclick="showPanel('dashboard')">📊 仪表盘</button>
-            <button class="tab" onclick="showPanel('backends')">🖥️ 后端管理</button>
-            <button class="tab" onclick="showPanel('access')">🛡️ 访问控制</button>
+            <button class="tab active" onclick="showPanel('dashboard')">📊 仪表�?/button>
+            <button class="tab" onclick="showPanel('backends')">🖥�?后端管理</button>
+            <button class="tab" onclick="showPanel('access')">🛡�?访问控制</button>
             <button class="tab" onclick="showPanel('logs')">📋 错误日志</button>
         </div>
-        
+
         <div id="dashboard" class="panel active">
-            <h3 style="margin-bottom: 20px;">近7天请求统计</h3>
-            <div class="chart-container">
-                <div class="bar-chart" id="chart"></div>
+            <div class="section">
+                <h3 class="section-title">📈 �?天请求趋�?/h3>
+                <div class="chart-row">
+                    <div class="chart-box">
+                        <h4>请求�?& 错误�?/h4>
+                        <div class="line-chart" id="lineChart"></div>
+                    </div>
+                    <div class="chart-box">
+                        <h4>流量分布</h4>
+                        <div class="pie-chart" id="pieChart"></div>
+                    </div>
+                </div>
             </div>
-            
-            <h3 style="margin: 30px 0 20px;">各端口统计</h3>
-            <table>
-                <thead>
-                    <tr>
-                        <th>端口</th>
-                        <th>名称</th>
-                        <th>今日请求</th>
-                        <th>成功率</th>
-                        <th>今日流量</th>
-                        <th>状态</th>
-                    </tr>
-                </thead>
-                <tbody id="portStats"></tbody>
-            </table>
+
+            <div class="section">
+                <h3 class="section-title">📊 专业分析</h3>
+                <div class="analysis-grid">
+                    <div class="analysis-card">
+                        <h4>请求分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天总请�?/span>
+                            <span class="analysis-value" id="weekTotal">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">日均请求</span>
+                            <span class="analysis-value" id="dailyAvg">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天成功率</span>
+                            <span class="analysis-value" id="weekSuccessRate">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">请求趋势</span>
+                            <span class="analysis-value" id="trend">-</span>
+                        </div>
+                    </div>
+                    <div class="analysis-card">
+                        <h4>流量分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天总流�?/span>
+                            <span class="analysis-value" id="weekBytes">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">日均流量</span>
+                            <span class="analysis-value" id="dailyBytesAvg">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">平均请求大小</span>
+                            <span class="analysis-value" id="avgRequestSize">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">峰值流量日</span>
+                            <span class="analysis-value" id="peakDay">-</span>
+                        </div>
+                    </div>
+                    <div class="analysis-card">
+                        <h4>性能分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">平均响应时间</span>
+                            <span class="analysis-value" id="avgResponseTime">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">最快响�?/span>
+                            <span class="analysis-value" id="minResponse">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">最慢响�?/span>
+                            <span class="analysis-value" id="maxResponse">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">健康状�?/span>
+                            <span class="analysis-value" id="healthStatus">-</span>
+                        </div>
+                    </div>
+                    <div class="analysis-card">
+                        <h4>错误分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天总错�?/span>
+                            <span class="analysis-value" id="weekErrors">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">错误�?/span>
+                            <span class="analysis-value" id="errorRate">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">错误最多端�?/span>
+                            <span class="analysis-value" id="errorPort">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">错误趋势</span>
+                            <span class="analysis-value" id="errorTrend">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3 class="section-title">🔌 各端口统�?/h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>端口</th>
+                            <th>名称</th>
+                            <th>今日请求</th>
+                            <th>成功�?/th>
+                            <th>今日流量</th>
+                            <th>平均响应</th>
+                            <th>状�?/th>
+                        </tr>
+                    </thead>
+                    <tbody id="portStats"></tbody>
+                </table>
+            </div>
         </div>
-        
+
         <div id="backends" class="panel">
-            <h3 style="margin-bottom: 20px;">后端服务器配置</h3>
+            <h3 style="margin-bottom: 20px;">后端服务器配�?/h3>
             <table>
                 <thead>
                     <tr>
                         <th>端口</th>
                         <th>名称</th>
                         <th>后端地址</th>
-                        <th>状态</th>
+                        <th>状�?/th>
                         <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="backendList"></tbody>
             </table>
-            
+
             <h3 style="margin: 30px 0 20px;">添加/编辑后端</h3>
             <div class="form-row">
                 <div class="form-group">
                     <label>端口</label>
-                    <input type="text" id="backendPort" placeholder="如: 8443">
+                    <input type="text" id="backendPort" placeholder="�? 8443">
                 </div>
                 <div class="form-group">
                     <label>名称</label>
-                    <input type="text" id="backendName" placeholder="如: Emby Server 1">
+                    <input type="text" id="backendName" placeholder="�? Emby Server 1">
                 </div>
                 <div class="form-group">
                     <label>后端地址</label>
@@ -413,10 +548,10 @@ function getAdminHTML() {
             <button class="btn btn-primary" onclick="saveBackend()">保存配置</button>
             <button class="btn btn-secondary" onclick="resetBackends()">恢复默认</button>
         </div>
-        
+
         <div id="access" class="panel">
             <h3 style="margin-bottom: 20px;">访问控制</h3>
-            
+
             <div class="form-group">
                 <label>黑名单IP（禁止访问）</label>
                 <div class="form-row">
@@ -425,7 +560,7 @@ function getAdminHTML() {
                 </div>
                 <div class="ip-list" id="blacklist"></div>
             </div>
-            
+
             <div class="form-group" style="margin-top: 30px;">
                 <label>白名单IP（仅允许这些IP访问，留空则允许所有）</label>
                 <div class="form-row">
@@ -434,14 +569,17 @@ function getAdminHTML() {
                 </div>
                 <div class="ip-list" id="whitelist"></div>
             </div>
-            
-            <p style="color: #888; margin-top: 20px;">💡 提示：白名单优先级高于黑名单。设置白名单后，只有白名单中的IP可以访问。</p>
+
+            <p style="color: #888; margin-top: 20px;">💡 提示：白名单优先级高于黑名单。设置白名单后，只有白名单中的IP可以访问�?/p>
         </div>
-        
+
         <div id="logs" class="panel">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h3>最近错误日志</h3>
-                <button class="btn btn-secondary" onclick="refreshLogs()">刷新</button>
+                <h3>错误日志</h3>
+                <div>
+                    <button class="btn btn-secondary" onclick="refreshLogs()">刷新</button>
+                    <button class="btn btn-danger" onclick="clearLogs()">清除全部</button>
+                </div>
             </div>
             <div id="errorLogs"></div>
         </div>
@@ -450,7 +588,8 @@ function getAdminHTML() {
     <script>
         let token = localStorage.getItem('admin_token') || '';
         let kvAvailable = true;
-        
+        let statsData = null;
+
         async function init() {
             if (token) {
                 document.getElementById('loginPage').style.display = 'none';
@@ -458,7 +597,7 @@ function getAdminHTML() {
                 await loadDashboard();
             }
         }
-        
+
         async function login() {
             const password = document.getElementById('password').value;
             try {
@@ -481,97 +620,241 @@ function getAdminHTML() {
                 document.getElementById('loginError').textContent = '网络错误';
             }
         }
-        
+
         function logout() {
             token = '';
             localStorage.removeItem('admin_token');
             document.getElementById('loginPage').style.display = 'flex';
             document.getElementById('mainPage').style.display = 'none';
         }
-        
+
         function showPanel(name) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
             event.target.classList.add('active');
             document.getElementById(name).classList.add('active');
-            
+
             if (name === 'access') loadAccessControl();
             if (name === 'logs') refreshLogs();
         }
-        
+
         async function loadDashboard() {
             try {
                 const res = await fetch('/admin/api/stats', {
                     headers: { 'Authorization': 'Bearer ' + token }
                 });
                 const data = await res.json();
-                
+                statsData = data;
+
                 if (data.kvWarning) {
                     kvAvailable = false;
                     document.getElementById('kvWarning').style.display = 'block';
                 }
-                
+
                 if (data.today) {
                     document.getElementById('todayTotal').textContent = data.today.total.toLocaleString();
                     const rate = data.today.total > 0 ? ((data.today.success / data.today.total) * 100).toFixed(1) : 0;
                     document.getElementById('successRate').textContent = rate + '%';
                     document.getElementById('todayBytes').textContent = formatBytes(data.today.bytes);
                     document.getElementById('todayErrors').textContent = data.today.error;
+                    
+                    const avgDuration = data.today.total > 0 ? (data.today.duration / data.today.total).toFixed(0) : 0;
+                    document.getElementById('avgDuration').textContent = avgDuration + 'ms';
                 }
-                
-                renderChart(data.history || []);
+
+                renderLineChart(data.history || []);
+                renderPieChart(data.today, data.backends);
+                renderAnalysis(data.history || [], data.today);
                 renderPortStats(data.today, data.backends);
                 renderBackendList(data.backends);
             } catch (e) {
-                console.error('加载仪表盘失败', e);
+                console.error('加载仪表盘失�?, e);
             }
         }
-        
+
         function formatBytes(bytes) {
             if (bytes === 0) return '0 B';
             const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
-        
-        function renderChart(history) {
-            const chart = document.getElementById('chart');
+
+        function renderLineChart(history) {
+            const container = document.getElementById('lineChart');
             if (!history.length) {
-                chart.innerHTML = '<p style="color: #888; text-align: center; width: 100%;">暂无数据</p>';
+                container.innerHTML = '<p style="color: #888; text-align: center; padding: 50px;">暂无数据</p>';
                 return;
             }
-            const max = Math.max(...history.map(h => h.total));
-            chart.innerHTML = history.reverse().map(h => {
-                const height = max > 0 ? (h.total / max * 200) : 0;
-                return '<div class="bar" style="height: ' + height + 'px" title="' + h.total + ' 请求">' +
-                    '<span class="bar-value">' + h.total + '</span>' +
-                    '<span class="bar-label">' + h.date.slice(5) + '</span></div>';
-            }).join('');
+            
+            const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+            const maxTotal = Math.max(...sorted.map(h => h.total), 1);
+            const width = 100;
+            const height = 80;
+            const padding = 5;
+            
+            let points = '';
+            let areaPoints = '';
+            let labels = '';
+            
+            sorted.forEach((h, i) => {
+                const x = padding + (i / (sorted.length - 1 || 1)) * (width - padding * 2);
+                const y = height - padding - (h.total / maxTotal) * (height - padding * 2);
+                points += (i === 0 ? 'M' : 'L') + x + ',' + y;
+                areaPoints += (i === 0 ? 'M' : 'L') + x + ',' + y;
+                if (i === sorted.length - 1) areaPoints += 'L' + x + ',' + (height - padding) + 'L' + padding + ',' + (height - padding) + 'Z';
+                labels += '<text x="' + x + '" y="' + (height + 3) + '" class="chart-label" text-anchor="middle">' + h.date.slice(5) + '</text>';
+            });
+            
+            container.innerHTML = '<svg viewBox="0 0 ' + width + ' ' + (height + 20) + '" preserveAspectRatio="xMidYMid meet">' +
+                '<defs><linearGradient id="gradient" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#4ecca3"/><stop offset="100%" stop-color="#4ecca300"/></linearGradient></defs>' +
+                '<path d="' + areaPoints + '" class="chart-area"/>' +
+                '<path d="' + points + '" class="chart-line"/>' +
+                labels +
+            '</svg>';
         }
-        
+
+        function renderPieChart(today, backends) {
+            const container = document.getElementById('pieChart');
+            if (!today || !today.ports || Object.keys(today.ports).length === 0) {
+                container.innerHTML = '<p style="color: #888;">暂无数据</p>';
+                return;
+            }
+            
+            const colors = ['#4ecca3', '#3db892', '#2ca58d', '#1b9178', '#0a7d63'];
+            const ports = Object.entries(today.ports);
+            const total = ports.reduce((sum, [, p]) => sum + p.bytes, 0);
+            
+            let cumulativePercent = 0;
+            let paths = '';
+            let legend = '';
+            
+            ports.forEach(([port, data], i) => {
+                const percent = total > 0 ? (data.bytes / total) : 0;
+                const startAngle = cumulativePercent * 2 * Math.PI;
+                const endAngle = (cumulativePercent + percent) * 2 * Math.PI;
+                
+                if (percent > 0) {
+                    const x1 = 50 + 40 * Math.sin(startAngle);
+                    const y1 = 50 - 40 * Math.cos(startAngle);
+                    const x2 = 50 + 40 * Math.sin(endAngle);
+                    const y2 = 50 - 40 * Math.cos(endAngle);
+                    const largeArc = percent > 0.5 ? 1 : 0;
+                    
+                    paths += '<path d="M50,50 L' + x1 + ',' + y1 + ' A40,40 0 ' + largeArc + ',1 ' + x2 + ',' + y2 + ' Z" fill="' + colors[i % colors.length] + '"/>';
+                }
+                
+                cumulativePercent += percent;
+                
+                const backend = backends[port] || {};
+                legend += '<div class="pie-legend-item">' +
+                    '<div class="pie-legend-color" style="background:' + colors[i % colors.length] + '"></div>' +
+                    '<span>' + (backend.name || port) + ': ' + formatBytes(data.bytes) + '</span>' +
+                '</div>';
+            });
+            
+            container.innerHTML = '<svg viewBox="0 0 100 100">' + paths + '</svg><div class="pie-legend">' + legend + '</div>';
+        }
+
+        function renderAnalysis(history, today) {
+            if (!history.length) {
+                document.getElementById('weekTotal').textContent = '-';
+                document.getElementById('dailyAvg').textContent = '-';
+                document.getElementById('weekSuccessRate').textContent = '-';
+                document.getElementById('trend').textContent = '-';
+                document.getElementById('weekBytes').textContent = '-';
+                document.getElementById('dailyBytesAvg').textContent = '-';
+                document.getElementById('avgRequestSize').textContent = '-';
+                document.getElementById('peakDay').textContent = '-';
+                return;
+            }
+            
+            const weekTotal = history.reduce((sum, h) => sum + h.total, 0);
+            const weekSuccess = history.reduce((sum, h) => sum + h.success, 0);
+            const weekErrors = history.reduce((sum, h) => sum + h.error, 0);
+            const weekBytes = history.reduce((sum, h) => sum + h.bytes, 0);
+            const weekDuration = history.reduce((sum, h) => sum + (h.duration || 0), 0);
+            
+            document.getElementById('weekTotal').textContent = weekTotal.toLocaleString();
+            document.getElementById('dailyAvg').textContent = Math.round(weekTotal / history.length).toLocaleString();
+            document.getElementById('weekSuccessRate').textContent = weekTotal > 0 ? ((weekSuccess / weekTotal) * 100).toFixed(1) + '%' : '-';
+            
+            // 趋势分析
+            if (history.length >= 2) {
+                const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+                const recent = sorted.slice(-3).reduce((s, h) => s + h.total, 0);
+                const previous = sorted.slice(-6, -3).reduce((s, h) => s + h.total, 0);
+                const trendPercent = previous > 0 ? ((recent - previous) / previous * 100).toFixed(0) : 0;
+                document.getElementById('trend').textContent = (trendPercent >= 0 ? '�? : '�?) + Math.abs(trendPercent) + '%';
+                document.getElementById('trend').style.color = trendPercent >= 0 ? '#4ecca3' : '#e94560';
+            }
+            
+            document.getElementById('weekBytes').textContent = formatBytes(weekBytes);
+            document.getElementById('dailyBytesAvg').textContent = formatBytes(weekBytes / history.length);
+            document.getElementById('avgRequestSize').textContent = weekTotal > 0 ? formatBytes(weekBytes / weekTotal) : '-';
+            
+            // 峰值流量日
+            const peakDay = history.reduce((max, h) => h.bytes > max.bytes ? h : max, history[0]);
+            document.getElementById('peakDay').textContent = peakDay.date;
+            
+            // 性能分析
+            document.getElementById('avgResponseTime').textContent = weekTotal > 0 ? (weekDuration / weekTotal).toFixed(0) + 'ms' : '-';
+            document.getElementById('minResponse').textContent = '-';
+            document.getElementById('maxResponse').textContent = '-';
+            
+            // 健康状�?
+            const errorRate = weekTotal > 0 ? (weekErrors / weekTotal * 100) : 0;
+            let health = '优秀', healthColor = '#4ecca3';
+            if (errorRate > 10) { health = '警告'; healthColor = '#f0a500'; }
+            if (errorRate > 30) { health = '异常'; healthColor = '#e94560'; }
+            document.getElementById('healthStatus').textContent = health;
+            document.getElementById('healthStatus').style.color = healthColor;
+            
+            // 错误分析
+            document.getElementById('weekErrors').textContent = weekErrors.toLocaleString();
+            document.getElementById('errorRate').textContent = errorRate.toFixed(2) + '%';
+            
+            // 错误最多端�?
+            if (today && today.ports) {
+                const errorPorts = Object.entries(today.ports).sort((a, b) => b[1].error - a[1].error);
+                document.getElementById('errorPort').textContent = errorPorts[0] ? errorPorts[0][0] : '-';
+            }
+            
+            // 错误趋势
+            if (history.length >= 2) {
+                const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+                const recentErrors = sorted.slice(-3).reduce((s, h) => s + h.error, 0);
+                const previousErrors = sorted.slice(-6, -3).reduce((s, h) => s + h.error, 0);
+                const errorTrend = previousErrors > 0 ? ((recentErrors - previousErrors) / previousErrors * 100).toFixed(0) : 0;
+                document.getElementById('errorTrend').textContent = (errorTrend >= 0 ? '�? : '�?) + Math.abs(errorTrend) + '%';
+                document.getElementById('errorTrend').style.color = errorTrend <= 0 ? '#4ecca3' : '#e94560';
+            }
+        }
+
         function renderPortStats(today, backends) {
             const tbody = document.getElementById('portStats');
             const ports = Object.keys(backends || {});
             if (!today || !today.ports) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #888;">暂无数据</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #888;">暂无数据</td></tr>';
                 return;
             }
             tbody.innerHTML = ports.map(port => {
                 const backend = backends[port];
-                const stats = today.ports[port] || { total: 0, success: 0, bytes: 0 };
+                const stats = today.ports[port] || { total: 0, success: 0, error: 0, bytes: 0 };
                 const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0;
+                const avgDuration = stats.total > 0 ? Math.round((today.duration || 0) / today.total) : 0;
                 return '<tr>' +
                     '<td>' + port + '</td>' +
                     '<td>' + (backend.name || '-') + '</td>' +
                     '<td>' + stats.total.toLocaleString() + '</td>' +
-                    '<td>' + rate + '%</td>' +
+                    '<td>' + rate + '%<div class="progress-bar"><div class="progress-fill" style="width:' + rate + '%"></div></div></td>' +
                     '<td>' + formatBytes(stats.bytes) + '</td>' +
+                    '<td>' + avgDuration + 'ms</td>' +
                     '<td><span class="status ' + (backend.enabled ? 'online' : 'offline') + '">' + (backend.enabled ? '启用' : '禁用') + '</span></td>' +
                     '</tr>';
             }).join('');
         }
-        
+
         function renderBackendList(backends) {
             const tbody = document.getElementById('backendList');
             tbody.innerHTML = Object.entries(backends || {}).map(([port, config]) => {
@@ -598,7 +881,7 @@ function getAdminHTML() {
             navigator.clipboard.writeText(url).then(() => {
                 // 显示复制成功提示
                 const toast = document.createElement('div');
-                toast.textContent = '已复制: ' + url;
+                toast.textContent = '已复�? ' + url;
                 toast.style.cssText = 'position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #4ecca3; color: #1a1a2e; padding: 12px 24px; border-radius: 5px; font-weight: bold; z-index: 9999;';
                 document.body.appendChild(toast);
                 setTimeout(() => toast.remove(), 2000);
@@ -628,7 +911,7 @@ function getAdminHTML() {
             const url = document.getElementById('backendUrl').value.trim();
             
             if (!port || !name || !url) {
-                alert('请填写完整信息');
+                alert('请填写完整信�?);
                 return;
             }
             
@@ -692,7 +975,7 @@ function getAdminHTML() {
         }
         
         async function resetBackends() {
-            if (!confirm('确定要恢复默认配置吗？这将覆盖当前所有后端配置。')) return;
+            if (!confirm('确定要恢复默认配置吗？这将覆盖当前所有后端配置�?)) return;
             try {
                 const res = await fetch('/admin/api/backends/reset', {
                     method: 'POST',
@@ -700,7 +983,7 @@ function getAdminHTML() {
                 });
                 const data = await res.json();
                 if (data.success) {
-                    alert('已恢复默认配置');
+                    alert('已恢复默认配�?);
                     loadDashboard();
                 }
             } catch (e) {}
@@ -799,6 +1082,20 @@ function getAdminHTML() {
             } catch (e) {}
         }
         
+        async function clearLogs() {
+            if (!confirm('确定要清除所有错误日志吗�?)) return;
+            try {
+                const res = await fetch('/admin/api/logs/clear', {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('errorLogs').innerHTML = '<p style="color: #888; text-align: center;">暂无错误日志</p>';
+                }
+            } catch (e) {}
+        }
+
         init();
     </script>
 </body>
@@ -814,7 +1111,7 @@ async function handleLogin(request, env) {
         if (env && env.EMBY_KV) {
             await env.EMBY_KV.put('session:admin', token, { expirationTtl: 86400 });
         } else {
-            // 没有KV时，存储到内存
+            // 没有KV时，存储到内�?
             memoryToken = token;
         }
         return new Response(JSON.stringify({ success: true, token }), {
@@ -831,7 +1128,7 @@ async function handleStatsAPI(request, env) {
     const hasKV = env && env.EMBY_KV;
 
     if (!await verifySession(request, env)) {
-        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: '未授�? }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const today = new Date().toISOString().split('T')[0];
@@ -849,7 +1146,7 @@ async function handleStatsAPI(request, env) {
 
 async function handleBackendsAPI(request, env) {
     if (!await verifySession(request, env)) {
-        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: '未授�? }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const backends = await getBackendConfig(env);
@@ -881,7 +1178,7 @@ async function handleBackendsAPI(request, env) {
 
 async function handleToggleBackendAPI(request, env) {
     if (!await verifySession(request, env)) {
-        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: '未授�? }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const body = await request.json();
@@ -893,12 +1190,12 @@ async function handleToggleBackendAPI(request, env) {
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
     }
     
-    return new Response(JSON.stringify({ error: '后端不存在' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ error: '后端不存�? }), { status: 404, headers: { 'Content-Type': 'application/json' } });
 }
 
 async function handleResetBackendsAPI(request, env) {
     if (!await verifySession(request, env)) {
-        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: '未授�? }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     await saveBackendConfig(env, DEFAULT_BACKENDS);
@@ -911,7 +1208,7 @@ async function handleAccessAPI(request, env) {
     }
     
     if (!await verifySession(request, env)) {
-        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: '未授�? }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     if (request.method === 'GET') {
@@ -942,13 +1239,34 @@ async function handleLogsAPI(request, env) {
     if (!env || !env.EMBY_KV) {
         return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json' } });
     }
-    
+
     if (!await verifySession(request, env)) {
-        return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: '未授�? }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
-    
+
     const logs = await getRecentErrors(env, 50);
     return new Response(JSON.stringify(logs), { headers: { 'Content-Type': 'application/json' } });
+}
+
+async function handleClearLogsAPI(request, env) {
+    if (!env || !env.EMBY_KV) {
+        return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    if (!await verifySession(request, env)) {
+        return new Response(JSON.stringify({ error: '未授�? }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // 获取所有错误日志的 key 并删�?
+    const list = await env.EMBY_KV.list({ prefix: 'logs:errors:' });
+    for (const key of list.keys) {
+        await env.EMBY_KV.delete(key.name);
+    }
+    
+    // 清空内存缓存
+    errorLogCache = [];
+    
+    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 }
 
 // ==================== 代理处理函数 ====================
@@ -1024,7 +1342,7 @@ async function handleProxy(request, env) {
         const response = await fetch(modifiedRequest);
         const responseHeaders = new Headers(response.headers);
         
-        // 拦截重定向
+        // 拦截重定�?
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = responseHeaders.get('Location');
             if (location && (location.startsWith('http://') || location.startsWith('https://'))) {
@@ -1056,12 +1374,12 @@ async function handleProxy(request, env) {
     }
 }
 
-// ==================== 主入口 ====================
+// ==================== 主入�?====================
 
 async function handleRequest(request, env) {
     const url = new URL(request.url);
     
-    // 管理面板路由（优先处理，不受 KV 影响）
+    // 管理面板路由（优先处理，不受 KV 影响�?
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
         return new Response(getAdminHTML(), {
             headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -1087,6 +1405,8 @@ async function handleRequest(request, env) {
                 return handleAccessAPI(request, env);
             case 'logs':
                 return handleLogsAPI(request, env);
+            case 'logs/clear':
+                return handleClearLogsAPI(request, env);
             default:
                 return new Response(JSON.stringify({ error: 'API not found' }), { 
                     status: 404, 
@@ -1099,7 +1419,7 @@ async function handleRequest(request, env) {
     return handleProxy(request, env);
 }
 
-// 事件监听器 - ES Modules 格式
+// 事件监听�?- ES Modules 格式
 export default {
     async fetch(request, env, ctx) {
         return handleRequest(request, env);
