@@ -43,14 +43,72 @@ function generateToken() {
 let memoryToken = null;
 
 // 内存中的统计缓存（减少KV写入频率）
-let statsCache = {
-    date: '',
-    data: { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} },
-    lastSave: 0
-};
+const STATS_RETENTION_TTL = 86400 * 90;
+const STATS_REQUEST_PREFIX = 'stats:req:';
+const STATS_TIMEZONE = 'Asia/Shanghai';
+const STATS_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+    timeZone: STATS_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+});
+
+function createEmptyStats() {
+    return { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
+}
+
+function getStatsDateString(date = new Date()) {
+    const parts = STATS_DATE_FORMATTER.formatToParts(date);
+    const year = parts.find(part => part.type === 'year')?.value || '1970';
+    const month = parts.find(part => part.type === 'month')?.value || '01';
+    const day = parts.find(part => part.type === 'day')?.value || '01';
+    return `${year}-${month}-${day}`;
+}
+
+function mergeStats(target, source) {
+    if (!source) return target;
+
+    target.total += Number(source.total) || 0;
+    target.success += Number(source.success) || 0;
+    target.error += Number(source.error) || 0;
+    target.bytes += Number(source.bytes) || 0;
+    target.duration += Number(source.duration) || 0;
+
+    if (source.ports && typeof source.ports === 'object') {
+        for (const [port, portStats] of Object.entries(source.ports)) {
+            if (!target.ports[port]) {
+                target.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
+            }
+            target.ports[port].total += Number(portStats?.total) || 0;
+            target.ports[port].success += Number(portStats?.success) || 0;
+            target.ports[port].error += Number(portStats?.error) || 0;
+            target.ports[port].bytes += Number(portStats?.bytes) || 0;
+        }
+    }
+
+    return target;
+}
+
+function addRequestStats(target, port, success, bytes, duration) {
+    const portKey = port || 'default';
+
+    target.total++;
+    if (success) target.success++;
+    else target.error++;
+    target.bytes += Number(bytes) || 0;
+    target.duration += Number(duration) || 0;
+
+    if (!target.ports[portKey]) {
+        target.ports[portKey] = { total: 0, success: 0, error: 0, bytes: 0 };
+    }
+
+    target.ports[portKey].total++;
+    if (success) target.ports[portKey].success++;
+    else target.ports[portKey].error++;
+    target.ports[portKey].bytes += Number(bytes) || 0;
+}
 
 // 统计写入间隔（毫秒）- 每30秒写入一次KV
-const STATS_SAVE_INTERVAL = 30000;
 
 // 验证管理员会话
 async function verifySession(request, env) {
@@ -118,41 +176,25 @@ async function saveBackendConfig(env, config) {
 async function recordStats(env, port, success, bytes, duration) {
     if (!env || !env.EMBY_KV) return;
     
-    const today = new Date().toISOString().split('T')[0];
-    const now = Date.now();
+    const statsKey = `${STATS_REQUEST_PREFIX}${getStatsDateString()}:${Date.now()}:${crypto.randomUUID()}`;
+    const payload = {
+        time: new Date().toISOString(),
+        port: port || 'default',
+        success: Boolean(success),
+        bytes: Number(bytes) || 0,
+        duration: Number(duration) || 0
+    };
     
     // 如果是新的一天，重置缓存
-    if (statsCache.date !== today) {
-        statsCache.date = today;
-        statsCache.data = { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
-        statsCache.lastSave = 0;
-    }
     
     // 更新内存中的统计数据
-    statsCache.data.total++;
-    if (success) statsCache.data.success++;
-    else statsCache.data.error++;
-    statsCache.data.bytes += bytes;
-    statsCache.data.duration += duration;
-    
-    if (!statsCache.data.ports[port]) {
-        statsCache.data.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
-    }
-    statsCache.data.ports[port].total++;
-    if (success) statsCache.data.ports[port].success++;
-    else statsCache.data.ports[port].error++;
-    statsCache.data.ports[port].bytes += bytes;
     
     // 每30秒写入一次KV，或者首次请求时写入
-    if (now - statsCache.lastSave >= STATS_SAVE_INTERVAL || statsCache.lastSave === 0) {
-        statsCache.lastSave = now;
-        try {
-            const key = `stats:${today}`;
-            await env.EMBY_KV.put(key, JSON.stringify(statsCache.data), { expirationTtl: 86400 * 90 });
-        } catch (e) {
+    try {
+        await env.EMBY_KV.put(statsKey, JSON.stringify(payload), { expirationTtl: STATS_RETENTION_TTL });
+    } catch (e) {
             // KV写入失败时忽略，不影响代理功能
-            console.error('KV write error:', e.message);
-        }
+        console.error('KV write error:', e.message);
     }
 }
 
@@ -210,17 +252,51 @@ async function getRecentErrors(env, limit = 50) {
 }
 
 // 获取统计数据
+async function getDailyStats(env, dateStr) {
+    const combinedStats = createEmptyStats();
+    if (!env || !env.EMBY_KV) return combinedStats;
+
+    const legacyStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
+    mergeStats(combinedStats, legacyStats);
+
+    let cursor = undefined;
+    do {
+        const page = await env.EMBY_KV.list({
+            prefix: `${STATS_REQUEST_PREFIX}${dateStr}:`,
+            limit: 1000,
+            cursor
+        });
+
+        const events = await Promise.all(
+            page.keys.map(key => env.EMBY_KV.get(key.name, { type: 'json' }))
+        );
+
+        for (const event of events) {
+            if (!event) continue;
+            addRequestStats(
+                combinedStats,
+                event.port || 'default',
+                Boolean(event.success),
+                event.bytes,
+                event.duration
+            );
+        }
+
+        cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+
+    return combinedStats;
+}
+
 async function getStatsSummary(env, days = 7) {
     if (!env || !env.EMBY_KV) return [];
     const stats = [];
-    const today = new Date();
     
     for (let i = 0; i < days; i++) {
-        const date = new Date(today);
-        date.setDate(date.getDate() - i);
-        const dateStr = date.toISOString().split('T')[0];
-        const dayStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
-        if (dayStats) {
+        const date = new Date(Date.now() - (i * 86400000));
+        const dateStr = getStatsDateString(date);
+        const dayStats = await getDailyStats(env, dateStr);
+        if (dayStats.total > 0 || dayStats.bytes > 0 || dayStats.error > 0 || dayStats.success > 0 || Object.keys(dayStats.ports).length > 0) {
             stats.push({ date: dateStr, ...dayStats });
         }
     }
@@ -1243,9 +1319,17 @@ async function handleStatsAPI(request, env) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const today = new Date().toISOString().split('T')[0];
-    const todayStats = hasKV ? (await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || { total: 0, success: 0, error: 0, bytes: 0, ports: {} }) : { total: 0, success: 0, error: 0, bytes: 0, ports: {} };
+    const today = getStatsDateString();
     const history = hasKV ? await getStatsSummary(env, 7) : [];
+    const todayEntry = history.find(item => item.date === today);
+    const todayStats = todayEntry ? {
+        total: todayEntry.total,
+        success: todayEntry.success,
+        error: todayEntry.error,
+        bytes: todayEntry.bytes,
+        duration: todayEntry.duration,
+        ports: todayEntry.ports
+    } : createEmptyStats();
     const backends = await getBackendConfig(env);
 
     return new Response(JSON.stringify({
