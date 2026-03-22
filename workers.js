@@ -16,17 +16,17 @@ const ADMIN_PASSWORD = "admin123"; // 请修改为强密码！
 const DEFAULT_BACKENDS = {
     "8443": {
         name: "Emby 2",
-        url: "https://link00.okemby.org:8443",
+        url: "",
         enabled: true
     },
     "2053": {
         name: "Emby 3",
-        url: "https://www.lilyemby.com",
+        url: "",
         enabled: true
     },
     "default": {
         name: "Emby 1 (默认)",
-        url: "http://wf.vban.com:8880",
+        url: ",
         enabled: true
     }
 };
