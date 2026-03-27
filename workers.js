@@ -5,7 +5,7 @@
 
 // ==================== 配置区 ====================
 // 管理员密码（建议通过环境变量设置：wrangler.toml 或 Cloudflare Dashboard）
-const ADMIN_PASSWORD = "admin123"; // 请修改为强密码！
+const ADMIN_PASSWORD = "yourpassword"; // 请修改为强密码！
 
 // KV 命名空间绑定（需要在 wrangler.toml 中配置）
 // [[kv_namespaces]]
@@ -16,17 +16,12 @@ const ADMIN_PASSWORD = "admin123"; // 请修改为强密码！
 const DEFAULT_BACKENDS = {
     "8443": {
         name: "Emby 2",
-        url: "",
+        url: "https://link00.okemby.org:8443",
         enabled: true
     },
     "2053": {
         name: "Emby 3",
-        url: "",
-        enabled: true
-    },
-    "default": {
-        name: "Emby 1 (默认)",
-        url: ",
+        url: "https://www.lilyemby.com",
         enabled: true
     }
 };
@@ -43,14 +38,80 @@ function generateToken() {
 let memoryToken = null;
 
 // 内存中的统计缓存（减少KV写入频率）
-let statsCache = {
-    date: '',
-    data: { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} },
-    lastSave: 0
-};
+const STATS_RETENTION_TTL = 86400 * 90;
+const STATS_REQUEST_PREFIX = 'stats:req:';
+const STATS_TIMEZONE = 'Asia/Shanghai';
+const STATS_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+    timeZone: STATS_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+});
+
+function createEmptyStats() {
+    return { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {}, peakQps: 0 };
+}
+
+const STATS_MINUTE_BUCKET_PREFIX = 'stats:req_per_minute:';
+const STATS_PEAK_QPS_PREFIX = 'stats:peak_qps:';
+
+
+function getStatsDateString(date = new Date()) {
+    const parts = STATS_DATE_FORMATTER.formatToParts(date);
+    const year = parts.find(part => part.type === 'year')?.value || '1970';
+    const month = parts.find(part => part.type === 'month')?.value || '01';
+    const day = parts.find(part => part.type === 'day')?.value || '01';
+    return `${year}-${month}-${day}`;
+}
+
+function mergeStats(target, source) {
+    if (!source) return target;
+
+    target.total += Number(source.total) || 0;
+    target.success += Number(source.success) || 0;
+    target.error += Number(source.error) || 0;
+    target.bytes += Number(source.bytes) || 0;
+    target.duration += Number(source.duration) || 0;
+
+    if (source.ports && typeof source.ports === 'object') {
+        for (const [port, portStats] of Object.entries(source.ports)) {
+            if (!target.ports[port]) {
+                target.ports[port] = { total: 0, success: 0, error: 0, bytes: 0, duration: 0 };
+            }
+            target.ports[port].total += Number(portStats?.total) || 0;
+            target.ports[port].success += Number(portStats?.success) || 0;
+            target.ports[port].error += Number(portStats?.error) || 0;
+            target.ports[port].bytes += Number(portStats?.bytes) || 0;
+            target.ports[port].duration += Number(portStats?.duration) || 0;
+        }
+    }
+
+    return target;
+}
+
+function addRequestStats(target, port, success, bytes, duration) {
+    const portKey = port || 'default';
+
+    target.total++;
+    if (success) target.success++;
+    else target.error++;
+    target.bytes += Number(bytes) || 0;
+    target.duration += Number(duration) || 0;
+
+    if (!target.ports[portKey]) {
+        target.ports[portKey] = { total: 0, success: 0, error: 0, bytes: 0, duration: 0 };
+    }
+
+    target.ports[portKey].total++;
+    if (success) target.ports[portKey].success++;
+    else target.ports[portKey].error++;
+    target.ports[portKey].bytes += Number(bytes) || 0;
+    target.ports[portKey].duration += Number(duration) || 0;
+}
 
 // 统计写入间隔（毫秒）- 每30秒写入一次KV
-const STATS_SAVE_INTERVAL = 30000;
+const PEAK_QPS_WRITE_INTERVAL = 10;
+let minuteCountCache = {}; // { date_bucket: count }
 
 // 验证管理员会话
 async function verifySession(request, env) {
@@ -118,41 +179,53 @@ async function saveBackendConfig(env, config) {
 async function recordStats(env, port, success, bytes, duration) {
     if (!env || !env.EMBY_KV) return;
     
-    const today = new Date().toISOString().split('T')[0];
-    const now = Date.now();
+    const statsKey = `${STATS_REQUEST_PREFIX}${getStatsDateString()}:${Date.now()}:${crypto.randomUUID()}`;
+    const payload = {
+        time: new Date().toISOString(),
+        port: port || 'default',
+        success: Boolean(success),
+        bytes: Number(bytes) || 0,
+        duration: Number(duration) || 0
+    };
+
+    // 精准峰值QPS统计：按每分钟请求数记录并计算最大值（每10次请求写一次KV）
+    try {
+        const now = Date.now();
+        const bucket = Math.floor(now / 60000);
+        const dateStr = getStatsDateString(new Date(now));
+        const bucketKey = `${dateStr}:${bucket}`;
+
+        minuteCountCache[bucketKey] = (minuteCountCache[bucketKey] || 0) + 1;
+
+        if (minuteCountCache[bucketKey] >= PEAK_QPS_WRITE_INTERVAL) {
+            const writeCount = minuteCountCache[bucketKey];
+            minuteCountCache[bucketKey] = 0;
+
+            const minuteKey = `${STATS_MINUTE_BUCKET_PREFIX}${dateStr}:${bucket}`;
+            let minuteCount = Number(await env.EMBY_KV.get(minuteKey)) || 0;
+            minuteCount += writeCount;
+            await env.EMBY_KV.put(minuteKey, String(minuteCount), { expirationTtl: STATS_RETENTION_TTL });
+
+            const peakKey = `${STATS_PEAK_QPS_PREFIX}${dateStr}`;
+            let currentPeak = Number(await env.EMBY_KV.get(peakKey)) || 0;
+            if (minuteCount > currentPeak) {
+                await env.EMBY_KV.put(peakKey, String(minuteCount), { expirationTtl: STATS_RETENTION_TTL });
+            }
+        }
+    } catch (e) {
+        console.error('KV peakQps update error:', e.message);
+    }
     
     // 如果是新的一天，重置缓存
-    if (statsCache.date !== today) {
-        statsCache.date = today;
-        statsCache.data = { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
-        statsCache.lastSave = 0;
-    }
     
     // 更新内存中的统计数据
-    statsCache.data.total++;
-    if (success) statsCache.data.success++;
-    else statsCache.data.error++;
-    statsCache.data.bytes += bytes;
-    statsCache.data.duration += duration;
-    
-    if (!statsCache.data.ports[port]) {
-        statsCache.data.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
-    }
-    statsCache.data.ports[port].total++;
-    if (success) statsCache.data.ports[port].success++;
-    else statsCache.data.ports[port].error++;
-    statsCache.data.ports[port].bytes += bytes;
     
     // 每30秒写入一次KV，或者首次请求时写入
-    if (now - statsCache.lastSave >= STATS_SAVE_INTERVAL || statsCache.lastSave === 0) {
-        statsCache.lastSave = now;
-        try {
-            const key = `stats:${today}`;
-            await env.EMBY_KV.put(key, JSON.stringify(statsCache.data), { expirationTtl: 86400 * 90 });
-        } catch (e) {
+    try {
+        await env.EMBY_KV.put(statsKey, JSON.stringify(payload), { expirationTtl: STATS_RETENTION_TTL });
+    } catch (e) {
             // KV写入失败时忽略，不影响代理功能
-            console.error('KV write error:', e.message);
-        }
+        console.error('KV write error:', e.message);
     }
 }
 
@@ -210,17 +283,54 @@ async function getRecentErrors(env, limit = 50) {
 }
 
 // 获取统计数据
-async function getStatsSummary(env, days = 7) {
+async function getDailyStats(env, dateStr) {
+    const combinedStats = createEmptyStats();
+    if (!env || !env.EMBY_KV) return combinedStats;
+
+    const legacyStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
+    mergeStats(combinedStats, legacyStats);
+
+    // 读取当日最高QPS
+    combinedStats.peakQps = Number(await env.EMBY_KV.get(`${STATS_PEAK_QPS_PREFIX}${dateStr}`)) || 0;
+
+    let cursor = undefined;
+    do {
+        const page = await env.EMBY_KV.list({
+            prefix: `${STATS_REQUEST_PREFIX}${dateStr}:`,
+            limit: 100,  // 减少limit以避免太多KV请求
+            cursor
+        });
+
+        const events = await Promise.all(
+            page.keys.map(key => env.EMBY_KV.get(key.name, { type: 'json' }))
+        );
+
+        for (const event of events) {
+            if (!event) continue;
+            addRequestStats(
+                combinedStats,
+                event.port || 'default',
+                Boolean(event.success),
+                event.bytes,
+                event.duration
+            );
+        }
+
+        cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+
+    return combinedStats;
+}
+
+async function getStatsSummary(env, days = 3) {  // 减少默认天数以减少KV请求
     if (!env || !env.EMBY_KV) return [];
     const stats = [];
-    const today = new Date();
     
     for (let i = 0; i < days; i++) {
-        const date = new Date(today);
-        date.setDate(date.getDate() - i);
-        const dateStr = date.toISOString().split('T')[0];
-        const dayStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
-        if (dayStats) {
+        const date = new Date(Date.now() - (i * 86400000));
+        const dateStr = getStatsDateString(date);
+        const dayStats = await getDailyStats(env, dateStr);
+        if (dayStats.total > 0 || dayStats.bytes > 0 || dayStats.error > 0 || dayStats.success > 0 || Object.keys(dayStats.ports).length > 0) {
             stats.push({ date: dateStr, ...dayStats });
         }
     }
@@ -237,134 +347,757 @@ function getAdminHTML() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Emby 反代管理面板</title>
     <style>
+        :root {
+            --bg: #08121f;
+            --panel: rgba(15, 26, 43, 0.86);
+            --panel-soft: rgba(18, 33, 53, 0.72);
+            --line: rgba(151, 167, 191, 0.16);
+            --text: #ecf4ff;
+            --muted: #93a7bf;
+            --brand: #62d1b2;
+            --brand-strong: #2aa582;
+            --danger: #ff8f78;
+            --warning: #f2c46d;
+            --shadow: 0 28px 60px rgba(0, 0, 0, 0.28);
+            --radius-lg: 26px;
+            --radius-md: 18px;
+            --radius-sm: 14px;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
-        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-        
-        .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-        .login-box { background: #16213e; padding: 40px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
-        .login-box h1 { text-align: center; margin-bottom: 30px; color: #4ecca3; }
-        .login-box input { width: 100%; padding: 15px; margin: 10px 0; border: none; border-radius: 5px; background: #1a1a2e; color: #fff; font-size: 16px; }
-        .login-box button { width: 100%; padding: 15px; border: none; border-radius: 5px; background: #4ecca3; color: #1a1a2e; font-size: 16px; cursor: pointer; font-weight: bold; }
-        .login-box button:hover { background: #3db892; }
-        
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #333; }
-        .header h1 { color: #4ecca3; }
-        .header button { padding: 10px 20px; border: none; border-radius: 5px; background: #e94560; color: #fff; cursor: pointer; }
-        
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
-        .stat-card { background: #16213e; padding: 20px; border-radius: 10px; text-align: center; }
-        .stat-card h3 { color: #888; font-size: 13px; margin-bottom: 8px; }
-        .stat-card .value { font-size: 28px; font-weight: bold; color: #4ecca3; }
-        .stat-card.error .value { color: #e94560; }
-        .stat-card.warning .value { color: #f0a500; }
-        
-        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-        .tab { padding: 12px 24px; background: #16213e; border: none; border-radius: 5px; color: #888; cursor: pointer; font-size: 14px; }
-        .tab.active { background: #4ecca3; color: #1a1a2e; font-weight: bold; }
-        .tab:hover:not(.active) { background: #1f3460; }
-        
-        .panel { display: none; background: #16213e; border-radius: 10px; padding: 25px; }
+        html, body { min-height: 100%; }
+        body {
+            font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at 10% 10%, rgba(98, 209, 178, 0.14), transparent 26%),
+                radial-gradient(circle at 85% 0%, rgba(59, 130, 246, 0.14), transparent 24%),
+                linear-gradient(160deg, #08121f 0%, #0b1626 45%, #0e1b2f 100%);
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: -25%;
+            background:
+                radial-gradient(circle at 20% 25%, rgba(98, 209, 178, 0.08), transparent 20%),
+                radial-gradient(circle at 80% 70%, rgba(59, 130, 246, 0.08), transparent 20%);
+            filter: blur(36px);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        a { color: #8fead1; text-decoration: none; }
+        a:hover { color: #c3fff0; }
+        button, input, select { font: inherit; }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 1480px;
+            margin: 0 auto;
+            padding: 28px 20px 40px;
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            padding: 7px 12px;
+            border: 1px solid rgba(98, 209, 178, 0.24);
+            border-radius: 999px;
+            background: rgba(98, 209, 178, 0.08);
+            color: #a9f1dd;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .login-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 24px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .login-box {
+            width: 100%;
+            max-width: 460px;
+            padding: 42px;
+            border: 1px solid var(--line);
+            border-radius: 30px;
+            background:
+                radial-gradient(circle at top right, rgba(98, 209, 178, 0.14), transparent 34%),
+                linear-gradient(160deg, rgba(12, 23, 39, 0.96), rgba(18, 33, 53, 0.9));
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(18px);
+        }
+
+        .login-box h1 {
+            margin: 18px 0 12px;
+            font-size: 34px;
+            line-height: 1.12;
+            letter-spacing: -0.04em;
+            color: var(--text);
+        }
+
+        .login-copy {
+            margin-bottom: 24px;
+            color: var(--muted);
+            line-height: 1.8;
+        }
+
+        .login-box input {
+            width: 100%;
+            padding: 15px 16px;
+            margin: 12px 0 14px;
+            border: 1px solid rgba(151, 167, 191, 0.16);
+            border-radius: 14px;
+            background: rgba(8, 16, 28, 0.7);
+            color: var(--text);
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .login-box input:focus,
+        .form-group input:focus,
+        .form-group select:focus {
+            border-color: rgba(98, 209, 178, 0.34);
+            box-shadow: 0 0 0 4px rgba(98, 209, 178, 0.1);
+        }
+
+        .login-box button,
+        .header button,
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 12px 18px;
+            border: 1px solid transparent;
+            border-radius: 14px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 700;
+            transition: transform 0.2s ease, opacity 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+        }
+
+        .login-box button {
+            width: 100%;
+            background: linear-gradient(135deg, var(--brand), var(--brand-strong));
+            color: #061711;
+            box-shadow: 0 18px 34px rgba(42, 165, 130, 0.24);
+        }
+
+        .login-box button:hover,
+        .header button:hover,
+        .btn:hover {
+            transform: translateY(-1px);
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 18px;
+            margin-bottom: 28px;
+            padding: 26px 28px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius-lg);
+            background:
+                radial-gradient(circle at top right, rgba(59, 130, 246, 0.14), transparent 30%),
+                linear-gradient(145deg, rgba(13, 25, 41, 0.96), rgba(18, 33, 53, 0.88));
+            box-shadow: var(--shadow);
+        }
+
+        .header h1 {
+            margin: 14px 0 10px;
+            font-size: clamp(30px, 4vw, 46px);
+            line-height: 1.08;
+            letter-spacing: -0.05em;
+            color: var(--text);
+        }
+
+        .header-subtitle {
+            color: var(--muted);
+            line-height: 1.8;
+            max-width: 740px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 12px;
+            align-items: stretch;
+            flex-wrap: wrap;
+        }
+
+        .header-chip {
+            min-width: 170px;
+            padding: 14px 16px;
+            border: 1px solid rgba(151, 167, 191, 0.12);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .header-chip span {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .header-chip strong {
+            display: block;
+            margin-top: 10px;
+            font-size: 15px;
+            word-break: break-all;
+        }
+
+        .header button {
+            background: linear-gradient(135deg, #ff9b85, #ff7b63);
+            color: #2c0903;
+            box-shadow: 0 16px 28px rgba(255, 123, 99, 0.18);
+        }
+
+        .hero-card {
+            position: relative;
+            overflow: hidden;
+            display: grid;
+            grid-template-columns: 1.35fr 0.9fr;
+            gap: 18px;
+            padding: 28px;
+            margin-bottom: 24px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius-lg);
+            background:
+                radial-gradient(circle at top right, rgba(59, 130, 246, 0.14), transparent 26%),
+                radial-gradient(circle at 10% 20%, rgba(98, 209, 178, 0.12), transparent 28%),
+                linear-gradient(145deg, rgba(13, 25, 41, 0.96), rgba(18, 33, 53, 0.88));
+            box-shadow: var(--shadow);
+        }
+
+        .hero-card::after {
+            content: "";
+            position: absolute;
+            right: -80px;
+            top: -110px;
+            width: 280px;
+            height: 280px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(98, 209, 178, 0.12), transparent 68%);
+            pointer-events: none;
+        }
+
+        .hero-copy h2 {
+            margin: 14px 0 12px;
+            font-size: clamp(30px, 3.5vw, 50px);
+            line-height: 1.05;
+            letter-spacing: -0.05em;
+        }
+
+        .hero-copy p {
+            max-width: 720px;
+            color: var(--muted);
+            line-height: 1.8;
+        }
+
+        .hero-metrics {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+            align-self: end;
+        }
+
+        .hero-metric {
+            padding: 16px 18px;
+            border: 1px solid rgba(151, 167, 191, 0.12);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .hero-metric span {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .hero-metric strong {
+            display: block;
+            margin-top: 10px;
+            font-size: 28px;
+            color: var(--text);
+            letter-spacing: -0.04em;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .stat-card,
+        .panel,
+        .chart-box,
+        .analysis-card {
+            border: 1px solid var(--line);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(16px);
+        }
+
+        .stat-card {
+            position: relative;
+            padding: 22px 20px;
+            border-radius: 22px;
+            background: linear-gradient(180deg, rgba(15, 26, 43, 0.95), rgba(18, 33, 53, 0.78));
+            text-align: left;
+        }
+
+        .stat-card::before {
+            content: "";
+            position: absolute;
+            left: 20px;
+            top: 18px;
+            width: 38px;
+            height: 4px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, var(--brand), rgba(98, 209, 178, 0.18));
+        }
+
+        .stat-card.error::before { background: linear-gradient(90deg, var(--danger), rgba(255, 143, 120, 0.18)); }
+        .stat-card.warning::before { background: linear-gradient(90deg, var(--warning), rgba(242, 196, 109, 0.18)); }
+
+        .stat-card h3 {
+            margin-top: 18px;
+            color: #a8bdd6;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .stat-card .value {
+            margin-top: 16px;
+            font-size: clamp(28px, 2.8vw, 38px);
+            font-weight: 800;
+            letter-spacing: -0.05em;
+            color: var(--brand);
+        }
+
+        .stat-card.warning .value { color: var(--warning); }
+        .stat-card.error .value { color: var(--danger); }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .tab {
+            padding: 13px 18px;
+            border-radius: 999px;
+            border: 1px solid rgba(151, 167, 191, 0.12);
+            background: rgba(255, 255, 255, 0.04);
+            color: #a6bdd8;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .tab.active {
+            background: linear-gradient(135deg, rgba(98, 209, 178, 0.2), rgba(59, 130, 246, 0.14));
+            color: var(--text);
+            border-color: rgba(98, 209, 178, 0.22);
+        }
+
+        .tab:hover:not(.active) {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text);
+        }
+
+        .panel {
+            display: none;
+            border-radius: var(--radius-lg);
+            padding: 26px;
+            background: linear-gradient(180deg, rgba(15, 26, 43, 0.94), rgba(18, 33, 53, 0.82));
+        }
+
         .panel.active { display: block; }
-        
         .section { margin-bottom: 30px; }
-        .section-title { font-size: 16px; color: #4ecca3; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #333; }
-        
+
+        .section-title {
+            font-size: 18px;
+            color: var(--text);
+            margin-bottom: 18px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(151, 167, 191, 0.12);
+            letter-spacing: -0.03em;
+        }
+
         .chart-row { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
-        @media (max-width: 900px) { .chart-row { grid-template-columns: 1fr; } }
-        
-        .chart-box { background: #1a1a2e; border-radius: 8px; padding: 20px; }
-        .chart-box h4 { color: #888; font-size: 14px; margin-bottom: 15px; }
-        
-        .line-chart { height: 200px; position: relative; padding: 10px 0 40px 50px; }
+        .chart-box {
+            border-radius: 20px;
+            padding: 22px;
+            background: rgba(8, 16, 28, 0.4);
+        }
+
+        .chart-box h4 {
+            color: #a8bdd6;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+
+        .line-chart { height: 220px; position: relative; padding: 8px 0 34px 18px; }
         .line-chart svg { width: 100%; height: 100%; }
-        .chart-line { fill: none; stroke: #4ecca3; stroke-width: 2; }
-        .chart-area { fill: url(#gradient); opacity: 0.3; }
-        .chart-label { font-size: 11px; fill: #888; }
-        
-        .pie-chart { display: flex; align-items: center; justify-content: center; gap: 20px; }
-        .pie-chart svg { width: 120px; height: 120px; }
-        .pie-legend { font-size: 12px; }
-        .pie-legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-        .pie-legend-color { width: 12px; height: 12px; border-radius: 2px; }
-        
-        .analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; }
-        .analysis-card { background: #1a1a2e; border-radius: 8px; padding: 15px; }
-        .analysis-card h4 { color: #888; font-size: 12px; margin-bottom: 10px; text-transform: uppercase; }
-        .analysis-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333; }
+        .chart-line { fill: none; stroke: var(--brand); stroke-width: 3; stroke-linecap: round; }
+        .chart-area { fill: url(#gradient); opacity: 0.34; }
+        .chart-label { font-size: 11px; fill: #91a7c3; }
+
+        .pie-chart { display: flex; align-items: center; justify-content: center; gap: 24px; min-height: 220px; }
+        .pie-chart svg { width: 140px; height: 140px; }
+        .pie-legend { font-size: 12px; color: var(--muted); }
+        .pie-legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .pie-legend-color { width: 12px; height: 12px; border-radius: 999px; }
+        .donut-center-label { fill: #8fa8c4; font-size: 6px; text-anchor: middle; }
+        .donut-center-value { fill: var(--text); font-size: 9px; font-weight: 700; text-anchor: middle; }
+
+        .analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+        .analysis-card {
+            border-radius: 18px;
+            padding: 18px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .analysis-card h4 {
+            color: #a8bdd6;
+            font-size: 12px;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .analysis-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(151, 167, 191, 0.08);
+        }
+
         .analysis-item:last-child { border-bottom: none; }
-        .analysis-label { color: #aaa; }
-        .analysis-value { color: #4ecca3; font-weight: bold; }
-        
+        .analysis-label { color: #a4bad5; }
+        .analysis-value { color: var(--brand); font-weight: 700; text-align: right; }
+        .analysis-value.is-good,
+        .analysis-value.is-warn,
+        .analysis-value.is-bad,
+        .stat-card .value.is-good,
+        .stat-card .value.is-warn,
+        .stat-card .value.is-bad {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 84px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            border: 1px solid transparent;
+        }
+        .analysis-value.is-good,
+        .stat-card .value.is-good {
+            color: #9ff2dc;
+            background: rgba(98, 209, 178, 0.14);
+            border-color: rgba(98, 209, 178, 0.24);
+        }
+        .analysis-value.is-warn,
+        .stat-card .value.is-warn {
+            color: #ffe2a6;
+            background: rgba(242, 196, 109, 0.14);
+            border-color: rgba(242, 196, 109, 0.24);
+        }
+        .analysis-value.is-bad,
+        .stat-card .value.is-bad {
+            color: #ffd2c8;
+            background: rgba(255, 143, 120, 0.14);
+            border-color: rgba(255, 143, 120, 0.24);
+        }
+
         table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #333; }
-        th { color: #4ecca3; font-weight: 600; font-size: 13px; }
-        tr:hover { background: rgba(78, 204, 163, 0.05); }
-        
+        th, td {
+            padding: 13px 12px;
+            text-align: left;
+            border-bottom: 1px solid rgba(151, 167, 191, 0.08);
+            vertical-align: top;
+        }
+
+        th {
+            color: #9fb5d0;
+            font-weight: 700;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        tr:hover { background: rgba(98, 209, 178, 0.04); }
+
         .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; margin-bottom: 8px; color: #888; }
-        .form-group input, .form-group select { width: 100%; padding: 12px; border: none; border-radius: 5px; background: #1a1a2e; color: #fff; font-size: 14px; }
-        .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
-        
-        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; margin-bottom: 5px; }
-        .btn-primary { background: #4ecca3; color: #1a1a2e; }
-        .btn-danger { background: #e94560; color: #fff; }
-        .btn-secondary { background: #333; color: #fff; }
-        .btn:hover { opacity: 0.9; }
-        
-        .status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; }
-        .status.online { background: #4ecca3; color: #1a1a2e; }
-        .status.offline { background: #e94560; color: #fff; }
-        
-        .log-entry { padding: 12px; border-left: 3px solid #e94560; background: rgba(233, 69, 96, 0.1); margin-bottom: 10px; border-radius: 0 5px 5px 0; }
-        .log-time { color: #888; font-size: 12px; }
-        .log-error { color: #e94560; margin-top: 5px; word-break: break-all; }
-        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #a8bdd6;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 13px 15px;
+            border: 1px solid rgba(151, 167, 191, 0.14);
+            border-radius: 14px;
+            background: rgba(8, 16, 28, 0.6);
+            color: var(--text);
+            font-size: 14px;
+            outline: none;
+        }
+
+        .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; }
+
+        .btn {
+            margin-right: 10px;
+            margin-bottom: 6px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--brand), var(--brand-strong));
+            color: #071711;
+            box-shadow: 0 16px 28px rgba(42, 165, 130, 0.2);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ff9b85, #ff7b63);
+            color: #2c0903;
+            box-shadow: 0 16px 28px rgba(255, 123, 99, 0.16);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.05);
+            border-color: rgba(151, 167, 191, 0.12);
+            color: var(--text);
+        }
+
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            border: 1px solid transparent;
+        }
+
+        .status.online {
+            background: rgba(98, 209, 178, 0.12);
+            color: #9ff2dc;
+            border-color: rgba(98, 209, 178, 0.2);
+        }
+
+        .status.offline {
+            background: rgba(255, 143, 120, 0.12);
+            color: #ffd6ce;
+            border-color: rgba(255, 143, 120, 0.2);
+        }
+
+        .log-entry {
+            padding: 16px 18px;
+            border-left: 3px solid var(--danger);
+            background: linear-gradient(180deg, rgba(255, 143, 120, 0.1), rgba(255, 143, 120, 0.04));
+            margin-bottom: 12px;
+            border-radius: 0 16px 16px 0;
+        }
+
+        .log-time { color: #a8bdd6; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+        .log-error { color: #ffdacf; margin-top: 8px; font-weight: 700; word-break: break-all; }
+
         .ip-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; }
-        .ip-item { background: #1a1a2e; padding: 8px 15px; border-radius: 20px; display: flex; align-items: center; gap: 10px; }
-        .ip-item button { background: none; border: none; color: #e94560; cursor: pointer; font-size: 18px; }
-        
-        .alert { padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .alert-warning { background: rgba(233, 69, 96, 0.2); border: 1px solid #e94560; color: #e94560; }
-        .alert-info { background: rgba(78, 204, 163, 0.1); border: 1px solid #4ecca3; color: #4ecca3; }
-        
-        .progress-bar { height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-top: 5px; }
-        .progress-fill { height: 100%; background: #4ecca3; border-radius: 4px; transition: width 0.3s; }
-        
-        /* 使用说明样式 */
-        .guide-section { margin-bottom: 25px; }
-        .guide-section h4 { color: #4ecca3; margin-bottom: 12px; font-size: 15px; }
-        .guide-section p { color: #aaa; line-height: 1.8; margin-bottom: 10px; }
-        .guide-section ul { color: #aaa; line-height: 1.8; margin-left: 20px; }
-        .guide-section li { margin-bottom: 5px; }
-        .guide-section code { background: #1a1a2e; padding: 2px 8px; border-radius: 4px; color: #4ecca3; font-family: 'Consolas', monospace; }
-        .guide-section pre { background: #1a1a2e; padding: 15px; border-radius: 8px; overflow-x: auto; margin: 10px 0; }
+        .ip-item {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 9px 14px;
+            border-radius: 999px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border: 1px solid rgba(151, 167, 191, 0.12);
+        }
+
+        .ip-item button {
+            width: 24px;
+            height: 24px;
+            border: none;
+            border-radius: 999px;
+            background: rgba(255, 143, 120, 0.18);
+            color: #ffd6ce;
+            cursor: pointer;
+        }
+
+        .alert {
+            padding: 16px 18px;
+            border-radius: 18px;
+            margin-bottom: 20px;
+        }
+
+        .alert-warning {
+            background: rgba(255, 143, 120, 0.12);
+            border: 1px solid rgba(255, 143, 120, 0.24);
+            color: #ffd5cb;
+        }
+
+        .alert-info {
+            background: rgba(98, 209, 178, 0.1);
+            border: 1px solid rgba(98, 209, 178, 0.2);
+            color: #baf7e8;
+        }
+
+        .progress-bar {
+            height: 8px;
+            background: rgba(151, 167, 191, 0.12);
+            border-radius: 999px;
+            overflow: hidden;
+            margin-top: 7px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--brand), #3b82f6);
+            border-radius: 999px;
+            transition: width 0.3s;
+        }
+
+        .guide-section { margin-bottom: 24px; }
+        .guide-section h4 {
+            color: var(--text);
+            margin-bottom: 12px;
+            font-size: 18px;
+            letter-spacing: -0.03em;
+        }
+
+        .guide-section p,
+        .guide-section ul { color: var(--muted); line-height: 1.85; }
+        .guide-section ul { margin-left: 20px; }
+        .guide-section li { margin-bottom: 6px; }
+
+        .guide-section code {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 2px 8px;
+            border-radius: 8px;
+            color: #9df0db;
+            font-family: Consolas, "SFMono-Regular", monospace;
+        }
+
+        .guide-section pre {
+            background: rgba(8, 16, 28, 0.66);
+            padding: 15px;
+            border-radius: 14px;
+            overflow-x: auto;
+            margin: 10px 0;
+            border: 1px solid rgba(151, 167, 191, 0.1);
+        }
+
         .guide-section pre code { background: none; padding: 0; }
-        .guide-tip { background: rgba(78, 204, 163, 0.1); border-left: 3px solid #4ecca3; padding: 12px 15px; margin: 15px 0; border-radius: 0 5px 5px 0; }
-        .guide-warning { background: rgba(233, 69, 96, 0.1); border-left: 3px solid #e94560; padding: 12px 15px; margin: 15px 0; border-radius: 0 5px 5px 0; }
-        
+
+        .guide-tip,
+        .guide-warning {
+            padding: 14px 16px;
+            margin: 15px 0;
+            border-radius: 16px;
+        }
+
+        .guide-tip {
+            background: rgba(98, 209, 178, 0.1);
+            border: 1px solid rgba(98, 209, 178, 0.18);
+            color: #baf7e8;
+        }
+
+        .guide-warning {
+            background: rgba(255, 143, 120, 0.1);
+            border: 1px solid rgba(255, 143, 120, 0.18);
+            color: #ffd9cf;
+        }
+
+        .toast {
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            z-index: 9999;
+            padding: 13px 16px;
+            border-radius: 14px;
+            background: rgba(8, 16, 28, 0.94);
+            color: var(--text);
+            border: 1px solid rgba(98, 209, 178, 0.2);
+            box-shadow: var(--shadow);
+        }
+
+        @media (max-width: 1100px) {
+            .header { flex-direction: column; }
+            .hero-card { grid-template-columns: 1fr; }
+            .chart-row { grid-template-columns: 1fr; }
+        }
+
         @media (max-width: 768px) {
+            .container { padding-left: 14px; padding-right: 14px; }
+            .login-box { padding: 34px 24px; }
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .hero-metrics { grid-template-columns: 1fr; }
             .form-row { grid-template-columns: 1fr; }
+            .header-actions { width: 100%; }
+            .header-chip { flex: 1; }
             table { font-size: 14px; }
             th, td { padding: 10px; }
+        }
+
+        @media (max-width: 560px) {
+            .stats-grid { grid-template-columns: 1fr; }
+            .tabs { gap: 8px; }
+            .tab { width: calc(50% - 4px); text-align: center; }
+            .header-chip { width: 100%; }
         }
     </style>
 </head>
 <body>
     <div id="loginPage" class="login-container">
         <div class="login-box">
-            <h1>🔐 管理登录</h1>
+            <span class="eyebrow">运营监控中心</span>
+            <h1>进入代理运营监控中心</h1>
+            <p class="login-copy">集中查看线路运行状态、请求趋势、安全策略与异常日志，为日常运营监控和稳定性巡检提供统一视图。</p>
             <input type="password" id="password" placeholder="请输入管理员密码" onkeypress="if(event.key==='Enter')login()">
-            <button onclick="login()">登 录</button>
+            <button onclick="login()">登录控制台</button>
             <p id="loginError" style="color: #e94560; text-align: center; margin-top: 15px;"></p>
         </div>
     </div>
     
     <div id="mainPage" class="container" style="display: none;">
         <div class="header">
-            <h1>🎬 Emby 反代管理面板</h1>
-            <button onclick="logout()">退出登录</button>
+            <div>
+                <span class="eyebrow">运营监控中心</span>
+                <h1>Emby 反代管理面板</h1>
+                <p class="header-subtitle">面向日常运营监控场景，集中查看请求趋势、线路状态、安全策略与异常波动，提升监控判断与处置效率。</p>
+            </div>
+            <div class="header-actions">
+                <div class="header-chip">
+                    <span>当前入口</span>
+                    <strong id="headerOrigin">-</strong>
+                </div>
+                <button onclick="logout()">退出登录</button>
+            </div>
         </div>
         
         <div id="kvWarning" class="alert alert-warning" style="display: none;">
@@ -393,22 +1126,36 @@ function getAdminHTML() {
                 <div class="value" id="avgDuration">-</div>
             </div>
             <div class="stat-card">
-                <h3>峰值 QPS</h3>
+                <h3>峰值请求/分钟</h3>
                 <div class="value" id="peakQps">-</div>
+            </div>
+        </div>
+
+        <div class="hero-card">
+            <div class="hero-copy">
+                <span class="eyebrow">运营总览</span>
+                <h2>集中掌握代理服务的核心运营态势。</h2>
+                <p>在同一视图中快速研判请求规模、服务可用性、异常波动与流量分布，支撑日常监控、巡检与稳定性运营。</p>
+            </div>
+            <div class="hero-metrics">
+                <div class="hero-metric"><span>今日请求</span><strong id="heroRequests">-</strong></div>
+                <div class="hero-metric"><span>启用后端</span><strong id="heroBackends">-</strong></div>
+                <div class="hero-metric"><span>成功率</span><strong id="heroSuccess">-</strong></div>
+                <div class="hero-metric"><span>平均延迟</span><strong id="heroLatency">-</strong></div>
             </div>
         </div>
         
         <div class="tabs">
-            <button class="tab active" onclick="showPanel('dashboard')">📊 仪表盘</button>
-            <button class="tab" onclick="showPanel('backends')">🖥️ 后端管理</button>
-            <button class="tab" onclick="showPanel('access')">🛡️ 访问控制</button>
-            <button class="tab" onclick="showPanel('logs')">📋 错误日志</button>
-            <button class="tab" onclick="showPanel('guide')">📖 使用说明</button>
+            <button class="tab active" onclick="showPanel('dashboard', this)">运营总览</button>
+            <button class="tab" onclick="showPanel('backends', this)">后端管理</button>
+            <button class="tab" onclick="showPanel('access', this)">访问控制</button>
+            <button class="tab" onclick="showPanel('logs', this)">异常日志</button>
+            <button class="tab" onclick="showPanel('guide', this)">部署说明</button>
         </div>
         
         <div id="dashboard" class="panel active">
             <div class="section">
-                <h3 class="section-title">📈 近7天请求趋势</h3>
+                <h3 class="section-title">近 7 天请求趋势</h3>
                 <div class="chart-row">
                     <div class="chart-box">
                         <h4>请求量趋势</h4>
@@ -422,10 +1169,10 @@ function getAdminHTML() {
             </div>
             
             <div class="section">
-                <h3 class="section-title">📊 专业分析</h3>
+                <h3 class="section-title">监控分析</h3>
                 <div class="analysis-grid">
                     <div class="analysis-card">
-                        <h4>请求分析</h4>
+                        <h4>请求监控</h4>
                         <div class="analysis-item">
                             <span class="analysis-label">7天总请求</span>
                             <span class="analysis-value" id="weekTotal">-</span>
@@ -444,7 +1191,7 @@ function getAdminHTML() {
                         </div>
                     </div>
                     <div class="analysis-card">
-                        <h4>流量分析</h4>
+                        <h4>流量监控</h4>
                         <div class="analysis-item">
                             <span class="analysis-label">7天总流量</span>
                             <span class="analysis-value" id="weekBytes">-</span>
@@ -463,7 +1210,7 @@ function getAdminHTML() {
                         </div>
                     </div>
                     <div class="analysis-card">
-                        <h4>性能分析</h4>
+                        <h4>性能监控</h4>
                         <div class="analysis-item">
                             <span class="analysis-label">平均响应时间</span>
                             <span class="analysis-value" id="avgResponseTime">-</span>
@@ -474,7 +1221,7 @@ function getAdminHTML() {
                         </div>
                     </div>
                     <div class="analysis-card">
-                        <h4>错误分析</h4>
+                        <h4>异常监控</h4>
                         <div class="analysis-item">
                             <span class="analysis-label">7天总错误</span>
                             <span class="analysis-value" id="weekErrors">-</span>
@@ -492,7 +1239,7 @@ function getAdminHTML() {
             </div>
             
             <div class="section">
-                <h3 class="section-title">🔌 各端口统计</h3>
+                <h3 class="section-title">各端口统计</h3>
                 <table>
                     <thead>
                         <tr>
@@ -570,7 +1317,7 @@ function getAdminHTML() {
         
         <div id="logs" class="panel">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h3>错误日志</h3>
+                <h3>异常日志</h3>
                 <div>
                     <button class="btn btn-secondary" onclick="refreshLogs()">刷新</button>
                     <button class="btn btn-danger" onclick="clearLogs()">清除全部</button>
@@ -580,7 +1327,7 @@ function getAdminHTML() {
         </div>
         
         <div id="guide" class="panel">
-            <h3 style="margin-bottom: 25px;">📖 使用说明</h3>
+            <h3 style="margin-bottom: 25px;">📖 部署说明</h3>
             
             <div class="guide-section">
                 <h4>一、部署 Worker</h4>
@@ -718,7 +1465,7 @@ function getAdminHTML() {
         let token = localStorage.getItem('admin_token') || '';
         let kvAvailable = true;
         let statsData = null;
-        
+
         async function init() {
             if (token) {
                 document.getElementById('loginPage').style.display = 'none';
@@ -757,10 +1504,12 @@ function getAdminHTML() {
             document.getElementById('mainPage').style.display = 'none';
         }
         
-        function showPanel(name) {
+        function showPanel(name, trigger) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-            event.target.classList.add('active');
+            if (trigger) {
+                trigger.classList.add('active');
+            }
             document.getElementById(name).classList.add('active');
             
             if (name === 'access') loadAccessControl();
@@ -774,21 +1523,42 @@ function getAdminHTML() {
                 });
                 const data = await res.json();
                 statsData = data;
+                const headerOrigin = document.getElementById('headerOrigin');
+                if (headerOrigin) {
+                    headerOrigin.textContent = window.location.host || window.location.origin;
+                }
                 
                 if (data.kvWarning) {
                     kvAvailable = false;
                     document.getElementById('kvWarning').style.display = 'block';
+                    document.getElementById('kvWarning').textContent = 'KV 未绑定，统计与管理功能会受到限制。请先创建 KV 命名空间并绑定到 Worker。';
+                } else {
+                    document.getElementById('kvWarning').style.display = 'none';
                 }
                 
                 if (data.today) {
                     document.getElementById('todayTotal').textContent = data.today.total.toLocaleString();
-                    const rate = data.today.total > 0 ? ((data.today.success / data.today.total) * 100).toFixed(1) : 0;
-                    document.getElementById('successRate').textContent = rate + '%';
+                    const rateValue = data.today.total > 0 ? ((data.today.success / data.today.total) * 100) : 0;
+                    document.getElementById('successRate').textContent = rateValue.toFixed(1) + '%';
+                    setMetricState(document.getElementById('successRate'), getSuccessState(rateValue));
                     document.getElementById('todayBytes').textContent = formatBytes(data.today.bytes);
                     document.getElementById('todayErrors').textContent = data.today.error;
                     
                     const avgDuration = data.today.total > 0 ? (data.today.duration / data.today.total).toFixed(0) : 0;
                     document.getElementById('avgDuration').textContent = avgDuration + 'ms';
+
+                    document.getElementById('peakQps').textContent = data.today.peakQps ? Math.round(data.today.peakQps).toLocaleString() + ' 次/分钟' : '-';
+                    const activeBackends = Object.values(data.backends || {}).filter(item => item && item.enabled).length;
+                    const heroRequests = document.getElementById('heroRequests');
+                    const heroBackends = document.getElementById('heroBackends');
+                    const heroSuccess = document.getElementById('heroSuccess');
+                    const heroLatency = document.getElementById('heroLatency');
+                    if (heroRequests) heroRequests.textContent = data.today.total.toLocaleString();
+                    if (heroBackends) heroBackends.textContent = String(activeBackends);
+                    if (heroSuccess) heroSuccess.textContent = rateValue.toFixed(1) + '%';
+                    if (heroLatency) heroLatency.textContent = avgDuration + 'ms';
+                } else {
+                    document.getElementById('peakQps').textContent = '-';
                 }
                 
                 renderLineChart(data.history || []);
@@ -807,6 +1577,24 @@ function getAdminHTML() {
             const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function setMetricState(element, state) {
+            if (!element) return;
+            element.classList.remove('is-good', 'is-warn', 'is-bad');
+            if (state) element.classList.add(state);
+        }
+
+        function getSuccessState(rate) {
+            if (rate >= 98) return 'is-good';
+            if (rate >= 90) return 'is-warn';
+            return 'is-bad';
+        }
+
+        function getErrorState(rate) {
+            if (rate <= 2) return 'is-good';
+            if (rate <= 10) return 'is-warn';
+            return 'is-bad';
         }
         
         function renderLineChart(history) {
@@ -850,7 +1638,7 @@ function getAdminHTML() {
                 return;
             }
             
-            const colors = ['#4ecca3', '#3db892', '#2ca58d', '#1b9178', '#0a7d63'];
+            const colors = ['#62d1b2', '#5b8cff', '#f2c46d', '#ff8f78', '#c084fc', '#34d399', '#f472b6', '#22c55e'];
             const ports = Object.entries(today.ports);
             const total = ports.reduce((sum, [, p]) => sum + p.bytes, 0);
             
@@ -864,13 +1652,23 @@ function getAdminHTML() {
                 const endAngle = (cumulativePercent + percent) * 2 * Math.PI;
                 
                 if (percent > 0) {
-                    const x1 = 50 + 40 * Math.sin(startAngle);
-                    const y1 = 50 - 40 * Math.cos(startAngle);
-                    const x2 = 50 + 40 * Math.sin(endAngle);
-                    const y2 = 50 - 40 * Math.cos(endAngle);
+                    const outerRadius = 40;
+                    const innerRadius = 22;
+                    const x1 = 50 + outerRadius * Math.sin(startAngle);
+                    const y1 = 50 - outerRadius * Math.cos(startAngle);
+                    const x2 = 50 + outerRadius * Math.sin(endAngle);
+                    const y2 = 50 - outerRadius * Math.cos(endAngle);
+                    const x3 = 50 + innerRadius * Math.sin(endAngle);
+                    const y3 = 50 - innerRadius * Math.cos(endAngle);
+                    const x4 = 50 + innerRadius * Math.sin(startAngle);
+                    const y4 = 50 - innerRadius * Math.cos(startAngle);
                     const largeArc = percent > 0.5 ? 1 : 0;
                     
-                    paths += '<path d="M50,50 L' + x1 + ',' + y1 + ' A40,40 0 ' + largeArc + ',1 ' + x2 + ',' + y2 + ' Z" fill="' + colors[i % colors.length] + '"/>';
+                    paths += '<path d="M' + x1 + ',' + y1 +
+                        ' A' + outerRadius + ',' + outerRadius + ' 0 ' + largeArc + ',1 ' + x2 + ',' + y2 +
+                        ' L' + x3 + ',' + y3 +
+                        ' A' + innerRadius + ',' + innerRadius + ' 0 ' + largeArc + ',0 ' + x4 + ',' + y4 +
+                        ' Z" fill="' + colors[i % colors.length] + '" stroke="rgba(8,18,31,0.72)" stroke-width="1.2"/>';
                 }
                 
                 cumulativePercent += percent;
@@ -882,7 +1680,11 @@ function getAdminHTML() {
                 '</div>';
             });
             
-            container.innerHTML = '<svg viewBox="0 0 100 100">' + paths + '</svg><div class="pie-legend">' + legend + '</div>';
+            container.innerHTML = '<svg viewBox="0 0 100 100">' +
+                paths +
+                '<text x="50" y="45" class="donut-center-label">总流量</text>' +
+                '<text x="50" y="56" class="donut-center-value">' + formatBytes(total) + '</text>' +
+                '</svg><div class="pie-legend">' + legend + '</div>';
         }
         
         function renderAnalysis(history, today) {
@@ -906,7 +1708,9 @@ function getAdminHTML() {
             
             document.getElementById('weekTotal').textContent = weekTotal.toLocaleString();
             document.getElementById('dailyAvg').textContent = Math.round(weekTotal / history.length).toLocaleString();
-            document.getElementById('weekSuccessRate').textContent = weekTotal > 0 ? ((weekSuccess / weekTotal) * 100).toFixed(1) + '%' : '-';
+            const weekSuccessRateValue = weekTotal > 0 ? ((weekSuccess / weekTotal) * 100) : 0;
+            document.getElementById('weekSuccessRate').textContent = weekTotal > 0 ? weekSuccessRateValue.toFixed(1) + '%' : '-';
+            setMetricState(document.getElementById('weekSuccessRate'), weekTotal > 0 ? getSuccessState(weekSuccessRateValue) : '');
             
             if (history.length >= 2) {
                 const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
@@ -932,9 +1736,11 @@ function getAdminHTML() {
             if (errorRate > 30) { health = '异常'; healthColor = '#e94560'; }
             document.getElementById('healthStatus').textContent = health;
             document.getElementById('healthStatus').style.color = healthColor;
+            setMetricState(document.getElementById('healthStatus'), getErrorState(errorRate));
             
             document.getElementById('weekErrors').textContent = weekErrors.toLocaleString();
             document.getElementById('errorRate').textContent = errorRate.toFixed(2) + '%';
+            setMetricState(document.getElementById('errorRate'), getErrorState(errorRate));
             
             if (history.length >= 2) {
                 const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
@@ -955,9 +1761,9 @@ function getAdminHTML() {
             }
             tbody.innerHTML = ports.map(port => {
                 const backend = backends[port];
-                const stats = today.ports[port] || { total: 0, success: 0, error: 0, bytes: 0 };
+                const stats = today.ports[port] || { total: 0, success: 0, error: 0, bytes: 0, duration: 0 };
                 const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0;
-                const avgDuration = stats.total > 0 ? Math.round((today.duration || 0) / today.total) : 0;
+                const avgDuration = stats.total > 0 ? Math.round((stats.duration || 0) / stats.total) : 0;
                 return '<tr>' +
                     '<td>' + port + '</td>' +
                     '<td>' + (backend.name || '-') + '</td>' +
@@ -994,10 +1800,10 @@ function getAdminHTML() {
         function copyProxyUrl(url) {
             navigator.clipboard.writeText(url).then(() => {
                 const toast = document.createElement('div');
-                toast.textContent = '已复制: ' + url;
-                toast.style.cssText = 'position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #4ecca3; color: #1a1a2e; padding: 12px 24px; border-radius: 5px; font-weight: bold; z-index: 9999;';
+                toast.className = 'toast';
+                toast.textContent = '已复制入口地址';
                 document.body.appendChild(toast);
-                setTimeout(() => toast.remove(), 2000);
+                setTimeout(() => toast.remove(), 2200);
             }).catch(() => {
                 alert('复制失败，请手动复制: ' + url);
             });
@@ -1181,7 +1987,7 @@ function getAdminHTML() {
                 const container = document.getElementById('errorLogs');
                 
                 if (!logs.length) {
-                    container.innerHTML = '<p style="color: #888; text-align: center;">暂无错误日志</p>';
+                    container.innerHTML = '<p style="color: #888; text-align: center;">暂无异常日志</p>';
                     return;
                 }
                 
@@ -1196,7 +2002,7 @@ function getAdminHTML() {
         }
         
         async function clearLogs() {
-            if (!confirm('确定要清除所有错误日志吗？')) return;
+            if (!confirm('确定要清除所有异常日志吗？')) return;
             try {
                 const res = await fetch('/admin/api/logs/clear', {
                     method: 'POST',
@@ -1204,7 +2010,7 @@ function getAdminHTML() {
                 });
                 const data = await res.json();
                 if (data.success) {
-                    document.getElementById('errorLogs').innerHTML = '<p style="color: #888; text-align: center;">暂无错误日志</p>';
+                    document.getElementById('errorLogs').innerHTML = '<p style="color: #888; text-align: center;">暂无异常日志</p>';
                 }
             } catch (e) {}
         }
@@ -1243,9 +2049,18 @@ async function handleStatsAPI(request, env) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const today = new Date().toISOString().split('T')[0];
-    const todayStats = hasKV ? (await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || { total: 0, success: 0, error: 0, bytes: 0, ports: {} }) : { total: 0, success: 0, error: 0, bytes: 0, ports: {} };
+    const today = getStatsDateString();
     const history = hasKV ? await getStatsSummary(env, 7) : [];
+    const todayEntry = history.find(item => item.date === today);
+    const todayStats = todayEntry ? {
+        total: todayEntry.total,
+        success: todayEntry.success,
+        error: todayEntry.error,
+        bytes: todayEntry.bytes,
+        duration: todayEntry.duration,
+        ports: todayEntry.ports,
+        peakQps: todayEntry.peakQps || 0
+    } : createEmptyStats();
     const backends = await getBackendConfig(env);
 
     return new Response(JSON.stringify({
@@ -1446,12 +2261,8 @@ async function handleProxy(request, env) {
         const response = await fetch(modifiedRequest);
         const responseHeaders = new Headers(response.headers);
 
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-            const location = responseHeaders.get('Location');
-            if (location && (location.startsWith('http://') || location.startsWith('https://'))) {
-                responseHeaders.set('Location', `/${encodeURIComponent(location)}`);
-            }
-        }
+        // 移除重定向处理，避免错误的重定向URL编码
+        // 如果后端返回绝对URL重定向，保持不变让浏览器直接访问
 
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Cache-Control', 'no-store');
