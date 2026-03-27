@@ -1,9 +1,16 @@
 # Emby 反向代理 + 管理面板
 
-一个功能完整的 Emby 反向代理系统，基于 Cloudflare Workers 构建，包含可视化仪表盘和管理后台。
+一个功能完整的 Emby 反向代理系统，基于 Cloudflare Workers 构建，包含可视化仪表盘和管理后台。重写了整个UI
 
 
-<img width="1280" height="1102" alt="image" src="https://github.com/user-attachments/assets/3164ad61-606a-4453-a12c-7b4d74b4c0b1" />
+<img width="1840" height="714" alt="image" src="https://github.com/user-attachments/assets/4bd03613-7cc5-45de-ba17-2d8d7a34c4fd" />
+
+<img width="1779" height="870" alt="image" src="https://github.com/user-attachments/assets/597e944d-e384-4894-b0b9-9121d59e1dd8" />
+
+<img width="1795" height="835" alt="image" src="https://github.com/user-attachments/assets/025055b4-1474-45b7-9ce0-929b22be4d0f" />
+
+
+
 
 
 ## ✨ 功能特性
