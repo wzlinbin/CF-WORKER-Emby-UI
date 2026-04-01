@@ -42,9 +42,32 @@ function generateToken() {
 // 内存中存储的token（用于无KV时的会话管理）
 let memoryToken = null;
 
+// 内存中的统计数据（Worker 重启或日期变更时重置）
+let currentStatsDate = null;
+let memoryStats = { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
+
+// 内存中的访问控制配置缓存（减少 KV 读取）
+let accessConfigCache = { blacklist: [], whitelist: [], lastUpdate: 0 };
+const ACCESS_CONFIG_TTL = 60000; // 60 秒缓存
+
+// 内存中的后端配置缓存
+let backendConfigCache = { config: null, lastUpdate: 0 };
+const BACKEND_CONFIG_TTL = 30000; // 30 秒缓存
+
+// 内存中的会话 token 缓存
+let sessionTokenCache = { token: null, lastUpdate: 0 };
+const SESSION_TTL = 60000; // 60 秒缓存
+
+// 检查并重置统计数据（每天自动重置）
+function checkStatsDate() {
+    const today = getStatsDateString();
+    if (currentStatsDate !== today) {
+        currentStatsDate = today;
+        memoryStats = createEmptyStats();
+    }
+}
+
 // 内存中的统计缓存（减少KV写入频率）
-const STATS_RETENTION_TTL = 86400 * 90;
-const STATS_REQUEST_PREFIX = 'stats:req:';
 const STATS_TIMEZONE = 'Asia/Shanghai';
 const STATS_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
     timeZone: STATS_TIMEZONE,
@@ -63,49 +86,6 @@ function getStatsDateString(date = new Date()) {
     const month = parts.find(part => part.type === 'month')?.value || '01';
     const day = parts.find(part => part.type === 'day')?.value || '01';
     return `${year}-${month}-${day}`;
-}
-
-function mergeStats(target, source) {
-    if (!source) return target;
-
-    target.total += Number(source.total) || 0;
-    target.success += Number(source.success) || 0;
-    target.error += Number(source.error) || 0;
-    target.bytes += Number(source.bytes) || 0;
-    target.duration += Number(source.duration) || 0;
-
-    if (source.ports && typeof source.ports === 'object') {
-        for (const [port, portStats] of Object.entries(source.ports)) {
-            if (!target.ports[port]) {
-                target.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
-            }
-            target.ports[port].total += Number(portStats?.total) || 0;
-            target.ports[port].success += Number(portStats?.success) || 0;
-            target.ports[port].error += Number(portStats?.error) || 0;
-            target.ports[port].bytes += Number(portStats?.bytes) || 0;
-        }
-    }
-
-    return target;
-}
-
-function addRequestStats(target, port, success, bytes, duration) {
-    const portKey = port || 'default';
-
-    target.total++;
-    if (success) target.success++;
-    else target.error++;
-    target.bytes += Number(bytes) || 0;
-    target.duration += Number(duration) || 0;
-
-    if (!target.ports[portKey]) {
-        target.ports[portKey] = { total: 0, success: 0, error: 0, bytes: 0 };
-    }
-
-    target.ports[portKey].total++;
-    if (success) target.ports[portKey].success++;
-    else target.ports[portKey].error++;
-    target.ports[portKey].bytes += Number(bytes) || 0;
 }
 
 // 统计写入间隔（毫秒）- 每30秒写入一次KV
@@ -159,56 +139,59 @@ async function checkIPAccess(clientIP, env) {
     return !blacklist.includes(clientIP);
 }
 
-// 获取后端配置
+// 获取后端配置（使用内存缓存减少 KV 读取）
 async function getBackendConfig(env) {
     if (!env || !env.EMBY_KV) return DEFAULT_BACKENDS;
+    
+    const now = Date.now();
+    
+    // 检查缓存是否有效
+    if (now - backendConfigCache.lastUpdate < BACKEND_CONFIG_TTL && backendConfigCache.config) {
+        return backendConfigCache.config;
+    }
+    
+    // 缓存过期，从 KV 读取
     const config = await env.EMBY_KV.get('config:backends', { type: 'json' });
-    return config || DEFAULT_BACKENDS;
+    backendConfigCache = { config: config || DEFAULT_BACKENDS, lastUpdate: now };
+    return backendConfigCache.config;
 }
 
-// 保存后端配置
+// 保存后端配置（同时更新缓存）
 async function saveBackendConfig(env, config) {
     if (!env || !env.EMBY_KV) return;
     await env.EMBY_KV.put('config:backends', JSON.stringify(config));
+    // 更新缓存
+    backendConfigCache = { config, lastUpdate: Date.now() };
 }
 
-// 记录统计数据（使用内存缓存，减少KV写入）
+// 记录统计数据（纯内存模式，不写入 KV）
 async function recordStats(env, port, success, bytes, duration) {
-    if (!env || !env.EMBY_KV) return;
-    
-    const statsKey = `${STATS_REQUEST_PREFIX}${getStatsDateString()}:${Date.now()}:${crypto.randomUUID()}`;
-    const payload = {
-        time: new Date().toISOString(),
-        port: port || 'default',
-        success: Boolean(success),
-        bytes: Number(bytes) || 0,
-        duration: Number(duration) || 0
-    };
-    
-    // 如果是新的一天，重置缓存
-    
+    // 检查并重置统计数据（每天自动重置）
+    checkStatsDate();
+
     // 更新内存中的统计数据
-    
-    // 每30秒写入一次KV，或者首次请求时写入
-    try {
-        await env.EMBY_KV.put(statsKey, JSON.stringify(payload), { expirationTtl: STATS_RETENTION_TTL });
-    } catch (e) {
-            // KV写入失败时忽略，不影响代理功能
-        console.error('KV write error:', e.message);
+    memoryStats.total++;
+    if (success) memoryStats.success++;
+    else memoryStats.error++;
+    memoryStats.bytes += Number(bytes) || 0;
+    memoryStats.duration += Number(duration) || 0;
+
+    const portKey = port || 'default';
+    if (!memoryStats.ports[portKey]) {
+        memoryStats.ports[portKey] = { total: 0, success: 0, error: 0, bytes: 0 };
     }
+    memoryStats.ports[portKey].total++;
+    if (success) memoryStats.ports[portKey].success++;
+    else memoryStats.ports[portKey].error++;
+    memoryStats.ports[portKey].bytes += Number(bytes) || 0;
 }
 
 // 错误日志缓存
 let errorLogCache = [];
-let lastErrorLogSave = 0;
-const ERROR_LOG_SAVE_INTERVAL = 60000; // 每60秒写入一次
 
 // 记录错误日志（使用缓存，减少KV写入）
+// 记录错误日志（纯内存模式）
 async function logError(env, port, error, url, clientIP) {
-    if (!env || !env.EMBY_KV) return;
-    
-    const now = Date.now();
-    
     // 添加到缓存
     errorLogCache.push({
         time: new Date().toISOString(),
@@ -218,90 +201,32 @@ async function logError(env, port, error, url, clientIP) {
         clientIP: clientIP
     });
     
-    // 只保留最近50条错误
+    // 只保留最近 50 条错误
     if (errorLogCache.length > 50) {
         errorLogCache = errorLogCache.slice(-50);
     }
-    
-    // 每60秒写入一次KV
-    if (now - lastErrorLogSave >= ERROR_LOG_SAVE_INTERVAL) {
-        lastErrorLogSave = now;
-        try {
-            // 只保存最新的错误
-            const recentErrors = errorLogCache.slice(-10);
-            for (let i = 0; i < recentErrors.length; i++) {
-                const key = `logs:errors:${now + i}`;
-                await env.EMBY_KV.put(key, JSON.stringify(recentErrors[i]), { expirationTtl: 86400 * 7 });
-            }
-        } catch (e) {
-            console.error('KV write error:', e.message);
-        }
-    }
 }
 
-// 获取最近错误日志
+// 获取最近错误日志（纯内存模式）
 async function getRecentErrors(env, limit = 50) {
-    if (!env || !env.EMBY_KV) return [];
-    const list = await env.EMBY_KV.list({ prefix: 'logs:errors:', limit: limit });
-    const logs = [];
-    for (const key of list.keys) {
-        const log = await env.EMBY_KV.get(key.name, { type: 'json' });
-        if (log) logs.push(log);
-    }
-    return logs.sort((a, b) => new Date(b.time) - new Date(a.time));
+    return errorLogCache.slice(-limit).sort((a, b) => new Date(b.time) - new Date(a.time));
 }
 
-// 获取统计数据
+// 获取统计数据（纯内存模式）
 async function getDailyStats(env, dateStr) {
-    const combinedStats = createEmptyStats();
-    if (!env || !env.EMBY_KV) return combinedStats;
-
-    const legacyStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
-    mergeStats(combinedStats, legacyStats);
-
-    let cursor = undefined;
-    do {
-        const page = await env.EMBY_KV.list({
-            prefix: `${STATS_REQUEST_PREFIX}${dateStr}:`,
-            limit: 1000,
-            cursor
-        });
-
-        const events = await Promise.all(
-            page.keys.map(key => env.EMBY_KV.get(key.name, { type: 'json' }))
-        );
-
-        for (const event of events) {
-            if (!event) continue;
-            addRequestStats(
-                combinedStats,
-                event.port || 'default',
-                Boolean(event.success),
-                event.bytes,
-                event.duration
-            );
-        }
-
-        cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
-
-    return combinedStats;
+    checkStatsDate();
+    const today = getStatsDateString();
+    // 只返回今天的内存统计数据
+    if (dateStr === today) {
+        return { ...memoryStats };
+    }
+    return createEmptyStats();
 }
 
-async function getStatsSummary(env, days = 7) {
-    if (!env || !env.EMBY_KV) return [];
-    const stats = [];
-    
-    for (let i = 0; i < days; i++) {
-        const date = new Date(Date.now() - (i * 86400000));
-        const dateStr = getStatsDateString(date);
-        const dayStats = await getDailyStats(env, dateStr);
-        if (dayStats.total > 0 || dayStats.bytes > 0 || dayStats.error > 0 || dayStats.success > 0 || Object.keys(dayStats.ports).length > 0) {
-            stats.push({ date: dateStr, ...dayStats });
-        }
-    }
-    
-    return stats;
+async function getStatsSummary(env, days = 1) {
+    // 纯内存模式：只返回今天的统计数据
+    checkStatsDate();
+    return [{ date: getStatsDateString(), ...memoryStats }];
 }
 
 // ==================== 管理面板 HTML ====================
@@ -1297,11 +1222,14 @@ async function handleLogin(request, env) {
     const body = await request.json();
     if (body.password === ADMIN_PASSWORD) {
         const token = generateToken();
+        // 同时设置内存 token（始终可用）
+        memoryToken = token;
+        // 如果有 KV，也存储到 KV（持久化）
         if (env && env.EMBY_KV) {
             await env.EMBY_KV.put('session:admin', token, { expirationTtl: 86400 });
-        } else {
-            memoryToken = token;
         }
+        // 更新缓存
+        sessionTokenCache = { token, lastUpdate: Date.now() };
         return new Response(JSON.stringify({ success: true, token }), {
             headers: { 'Content-Type': 'application/json' }
         });
@@ -1313,30 +1241,22 @@ async function handleLogin(request, env) {
 }
 
 async function handleStatsAPI(request, env) {
-    const hasKV = env && env.EMBY_KV;
+    // 纯内存模式：直接从内存获取统计数据
+    checkStatsDate();
 
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
     const today = getStatsDateString();
-    const history = hasKV ? await getStatsSummary(env, 7) : [];
-    const todayEntry = history.find(item => item.date === today);
-    const todayStats = todayEntry ? {
-        total: todayEntry.total,
-        success: todayEntry.success,
-        error: todayEntry.error,
-        bytes: todayEntry.bytes,
-        duration: todayEntry.duration,
-        ports: todayEntry.ports
-    } : createEmptyStats();
+    const todayStats = { ...memoryStats };
     const backends = await getBackendConfig(env);
 
     return new Response(JSON.stringify({
         today: todayStats,
-        history: history,
+        history: [{ date: today, ...todayStats }],
         backends: backends,
-        kvWarning: !hasKV
+        kvWarning: false  // 不再显示 KV 警告
     }), { headers: { 'Content-Type': 'application/json' } });
 }
 
@@ -1445,19 +1365,11 @@ async function handleLogsAPI(request, env) {
 }
 
 async function handleClearLogsAPI(request, env) {
-    if (!env || !env.EMBY_KV) {
-        return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-    }
-
     if (!await verifySession(request, env)) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const list = await env.EMBY_KV.list({ prefix: 'logs:errors:' });
-    for (const key of list.keys) {
-        await env.EMBY_KV.delete(key.name);
-    }
-
+    // 清空内存中的错误缓存
     errorLogCache = [];
 
     return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
