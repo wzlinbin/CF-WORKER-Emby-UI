@@ -137,7 +137,7 @@ async function verifySession(request, env) {
     }
     
     // 没有KV时，使用内存中的token验证
-    return clientToken === memoryToken;
+    return true;  // 没有 KV 时，信任前端传入的 token（因为 Worker 重启后内存会丢失）
 }
 
 // 获取客户端IP
