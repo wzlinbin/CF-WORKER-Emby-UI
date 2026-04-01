@@ -5,7 +5,7 @@
 
 // ==================== 配置区 ====================
 // 管理员密码（建议通过环境变量设置：wrangler.toml 或 Cloudflare Dashboard）
-const ADMIN_PASSWORD = "yourpassword"; // 请修改为强密码！
+const ADMIN_PASSWORD = "admin123"; // 请修改为强密码！
 
 // KV 命名空间绑定（需要在 wrangler.toml 中配置）
 // [[kv_namespaces]]
@@ -16,12 +16,17 @@ const ADMIN_PASSWORD = "yourpassword"; // 请修改为强密码！
 const DEFAULT_BACKENDS = {
     "8443": {
         name: "Emby 2",
-        url: "https://XXX.YYY.ZZZ:8443",
+        url: "https://link00.okemby.org:8443",
         enabled: true
     },
     "2053": {
         name: "Emby 3",
-        url: "https://XXX.YYY.ZZZ",
+        url: "https://www.lilyemby.com",
+        enabled: true
+    },
+    "default": {
+        name: "Emby 1 (默认)",
+        url: "http://wf.vban.com:8880",
         enabled: true
     }
 };
@@ -38,80 +43,14 @@ function generateToken() {
 let memoryToken = null;
 
 // 内存中的统计缓存（减少KV写入频率）
-const STATS_RETENTION_TTL = 86400 * 90;
-const STATS_REQUEST_PREFIX = 'stats:req:';
-const STATS_TIMEZONE = 'Asia/Shanghai';
-const STATS_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
-    timeZone: STATS_TIMEZONE,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-});
-
-function createEmptyStats() {
-    return { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {}, peakQps: 0 };
-}
-
-const STATS_MINUTE_BUCKET_PREFIX = 'stats:req_per_minute:';
-const STATS_PEAK_QPS_PREFIX = 'stats:peak_qps:';
-
-
-function getStatsDateString(date = new Date()) {
-    const parts = STATS_DATE_FORMATTER.formatToParts(date);
-    const year = parts.find(part => part.type === 'year')?.value || '1970';
-    const month = parts.find(part => part.type === 'month')?.value || '01';
-    const day = parts.find(part => part.type === 'day')?.value || '01';
-    return `${year}-${month}-${day}`;
-}
-
-function mergeStats(target, source) {
-    if (!source) return target;
-
-    target.total += Number(source.total) || 0;
-    target.success += Number(source.success) || 0;
-    target.error += Number(source.error) || 0;
-    target.bytes += Number(source.bytes) || 0;
-    target.duration += Number(source.duration) || 0;
-
-    if (source.ports && typeof source.ports === 'object') {
-        for (const [port, portStats] of Object.entries(source.ports)) {
-            if (!target.ports[port]) {
-                target.ports[port] = { total: 0, success: 0, error: 0, bytes: 0, duration: 0 };
-            }
-            target.ports[port].total += Number(portStats?.total) || 0;
-            target.ports[port].success += Number(portStats?.success) || 0;
-            target.ports[port].error += Number(portStats?.error) || 0;
-            target.ports[port].bytes += Number(portStats?.bytes) || 0;
-            target.ports[port].duration += Number(portStats?.duration) || 0;
-        }
-    }
-
-    return target;
-}
-
-function addRequestStats(target, port, success, bytes, duration) {
-    const portKey = port || 'default';
-
-    target.total++;
-    if (success) target.success++;
-    else target.error++;
-    target.bytes += Number(bytes) || 0;
-    target.duration += Number(duration) || 0;
-
-    if (!target.ports[portKey]) {
-        target.ports[portKey] = { total: 0, success: 0, error: 0, bytes: 0, duration: 0 };
-    }
-
-    target.ports[portKey].total++;
-    if (success) target.ports[portKey].success++;
-    else target.ports[portKey].error++;
-    target.ports[portKey].bytes += Number(bytes) || 0;
-    target.ports[portKey].duration += Number(duration) || 0;
-}
+let statsCache = {
+    date: '',
+    data: { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} },
+    lastSave: 0
+};
 
 // 统计写入间隔（毫秒）- 每30秒写入一次KV
-const PEAK_QPS_WRITE_INTERVAL = 10;
-let minuteCountCache = {}; // { date_bucket: count }
+const STATS_SAVE_INTERVAL = 30000;
 
 // 验证管理员会话
 async function verifySession(request, env) {
@@ -137,7 +76,7 @@ async function verifySession(request, env) {
     }
     
     // 没有KV时，使用内存中的token验证
-    return true;  // 没有 KV 时，信任前端传入的 token（因为 Worker 重启后内存会丢失）
+    return clientToken === memoryToken;
 }
 
 // 获取客户端IP
@@ -179,53 +118,41 @@ async function saveBackendConfig(env, config) {
 async function recordStats(env, port, success, bytes, duration) {
     if (!env || !env.EMBY_KV) return;
     
-    const statsKey = `${STATS_REQUEST_PREFIX}${getStatsDateString()}:${Date.now()}:${crypto.randomUUID()}`;
-    const payload = {
-        time: new Date().toISOString(),
-        port: port || 'default',
-        success: Boolean(success),
-        bytes: Number(bytes) || 0,
-        duration: Number(duration) || 0
-    };
-
-    // 精准峰值QPS统计：按每分钟请求数记录并计算最大值（每10次请求写一次KV）
-    try {
-        const now = Date.now();
-        const bucket = Math.floor(now / 60000);
-        const dateStr = getStatsDateString(new Date(now));
-        const bucketKey = `${dateStr}:${bucket}`;
-
-        minuteCountCache[bucketKey] = (minuteCountCache[bucketKey] || 0) + 1;
-
-        if (minuteCountCache[bucketKey] >= PEAK_QPS_WRITE_INTERVAL) {
-            const writeCount = minuteCountCache[bucketKey];
-            minuteCountCache[bucketKey] = 0;
-
-            const minuteKey = `${STATS_MINUTE_BUCKET_PREFIX}${dateStr}:${bucket}`;
-            let minuteCount = Number(await env.EMBY_KV.get(minuteKey)) || 0;
-            minuteCount += writeCount;
-            await env.EMBY_KV.put(minuteKey, String(minuteCount), { expirationTtl: STATS_RETENTION_TTL });
-
-            const peakKey = `${STATS_PEAK_QPS_PREFIX}${dateStr}`;
-            let currentPeak = Number(await env.EMBY_KV.get(peakKey)) || 0;
-            if (minuteCount > currentPeak) {
-                await env.EMBY_KV.put(peakKey, String(minuteCount), { expirationTtl: STATS_RETENTION_TTL });
-            }
-        }
-    } catch (e) {
-        console.error('KV peakQps update error:', e.message);
-    }
+    const today = new Date().toISOString().split('T')[0];
+    const now = Date.now();
     
     // 如果是新的一天，重置缓存
+    if (statsCache.date !== today) {
+        statsCache.date = today;
+        statsCache.data = { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
+        statsCache.lastSave = 0;
+    }
     
     // 更新内存中的统计数据
+    statsCache.data.total++;
+    if (success) statsCache.data.success++;
+    else statsCache.data.error++;
+    statsCache.data.bytes += bytes;
+    statsCache.data.duration += duration;
+    
+    if (!statsCache.data.ports[port]) {
+        statsCache.data.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
+    }
+    statsCache.data.ports[port].total++;
+    if (success) statsCache.data.ports[port].success++;
+    else statsCache.data.ports[port].error++;
+    statsCache.data.ports[port].bytes += bytes;
     
     // 每30秒写入一次KV，或者首次请求时写入
-    try {
-        await env.EMBY_KV.put(statsKey, JSON.stringify(payload), { expirationTtl: STATS_RETENTION_TTL });
-    } catch (e) {
+    if (now - statsCache.lastSave >= STATS_SAVE_INTERVAL || statsCache.lastSave === 0) {
+        statsCache.lastSave = now;
+        try {
+            const key = `stats:${today}`;
+            await env.EMBY_KV.put(key, JSON.stringify(statsCache.data), { expirationTtl: 86400 * 90 });
+        } catch (e) {
             // KV写入失败时忽略，不影响代理功能
-        console.error('KV write error:', e.message);
+            console.error('KV write error:', e.message);
+        }
     }
 }
 
@@ -283,54 +210,17 @@ async function getRecentErrors(env, limit = 50) {
 }
 
 // 获取统计数据
-async function getDailyStats(env, dateStr) {
-    const combinedStats = createEmptyStats();
-    if (!env || !env.EMBY_KV) return combinedStats;
-
-    const legacyStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
-    mergeStats(combinedStats, legacyStats);
-
-    // 读取当日最高QPS
-    combinedStats.peakQps = Number(await env.EMBY_KV.get(`${STATS_PEAK_QPS_PREFIX}${dateStr}`)) || 0;
-
-    let cursor = undefined;
-    do {
-        const page = await env.EMBY_KV.list({
-            prefix: `${STATS_REQUEST_PREFIX}${dateStr}:`,
-            limit: 100,  // 减少limit以避免太多KV请求
-            cursor
-        });
-
-        const events = await Promise.all(
-            page.keys.map(key => env.EMBY_KV.get(key.name, { type: 'json' }))
-        );
-
-        for (const event of events) {
-            if (!event) continue;
-            addRequestStats(
-                combinedStats,
-                event.port || 'default',
-                Boolean(event.success),
-                event.bytes,
-                event.duration
-            );
-        }
-
-        cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
-
-    return combinedStats;
-}
-
-async function getStatsSummary(env, days = 3) {  // 减少默认天数以减少KV请求
+async function getStatsSummary(env, days = 7) {
     if (!env || !env.EMBY_KV) return [];
     const stats = [];
+    const today = new Date();
     
     for (let i = 0; i < days; i++) {
-        const date = new Date(Date.now() - (i * 86400000));
-        const dateStr = getStatsDateString(date);
-        const dayStats = await getDailyStats(env, dateStr);
-        if (dayStats.total > 0 || dayStats.bytes > 0 || dayStats.error > 0 || dayStats.success > 0 || Object.keys(dayStats.ports).length > 0) {
+        const date = new Date(today);
+        date.setDate(date.getDate() - i);
+        const dateStr = date.toISOString().split('T')[0];
+        const dayStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
+        if (dayStats) {
             stats.push({ date: dateStr, ...dayStats });
         }
     }
@@ -347,132 +237,980 @@ function getAdminHTML() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Emby 反代管理面板</title>
     <style>
-        :root{--bg-primary:#0a0e1a;--bg-secondary:#111827;--bg-card:rgba(17,24,39,0.8);--border-color:rgba(59,130,246,0.1);--text-primary:#f8fafc;--text-secondary:#94a3b8;--accent-primary:#3b82f6;--success:#10b981;--danger:#ef4444}
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;background:var(--bg-primary);color:var(--text-primary);min-height:100vh}
-        .container{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px}
-        .login-wrapper{display:flex;justify-content:center;align-items:center;min-height:100vh}
-        .login-card{width:100%;max-width:420px;padding:40px;background:var(--bg-card);backdrop-filter:blur(20px);border:1px solid var(--border-color);border-radius:24px;box-shadow:0 10px 40px rgba(0,0,0,0.5)}
-        .login-logo{width:64px;height:64px;margin:0 auto 20px;background:linear-gradient(135deg,var(--accent-primary),#8b5cf6);border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:28px;box-shadow:0 8px 32px rgba(59,130,246,0.3)}
-        .login-title{text-align:center;font-size:24px;font-weight:600;margin-bottom:8px;background:linear-gradient(135deg,var(--text-primary),var(--accent-primary));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-        .login-subtitle{text-align:center;color:var(--text-secondary);font-size:14px;margin-bottom:32px}
-        .form-input{width:100%;padding:14px 18px;margin-bottom:16px;background:rgba(0,0,0,0.3);border:1px solid var(--border-color);border-radius:12px;color:var(--text-primary);font-size:15px;transition:all 0.3s}
-        .form-input:focus{outline:none;border-color:var(--accent-primary);box-shadow:0 0 0 4px rgba(59,130,246,0.1)}
-        .btn-primary{width:100%;padding:14px;background:linear-gradient(135deg,var(--accent-primary),#8b5cf6);border:none;border-radius:12px;color:white;font-size:15px;font-weight:600;cursor:pointer;box-shadow:0 4px 20px rgba(59,130,246,0.3);transition:all 0.3s}
-        .btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(59,130,246,0.4)}
-        .dashboard-header{display:flex;justify-content:space-between;align-items:center;padding:24px 28px;background:var(--bg-card);backdrop-filter:blur(20px);border:1px solid var(--border-color);border-radius:20px;margin-bottom:24px}
-        .header-left h1{font-size:28px;font-weight:700;margin-bottom:4px}
-        .header-left p{color:var(--text-secondary);font-size:14px}
-        .header-right{display:flex;gap:16px;align-items:center}
-        .server-status{display:flex;align-items:center;gap:8px;padding:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.2);border-radius:12px;color:var(--success);font-size:13px;font-weight:500}
-        .status-dot{width:8px;height:8px;background:var(--success);border-radius:50%;animation:pulse 2s ease-in-out infinite}
-        @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(1.2)}}
-        .btn-logout{padding:10px 20px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:12px;color:var(--danger);font-size:14px;font-weight:500;cursor:pointer;transition:all 0.3s}
-        .btn-logout:hover{background:rgba(239,68,68,0.2);transform:translateY(-1px)}
-        .stats-overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:24px}
-        .stat-card{position:relative;padding:24px;background:var(--bg-card);backdrop-filter:blur(20px);border:1px solid var(--border-color);border-radius:20px;overflow:hidden;transition:all 0.3s}
-        .stat-card::before{content:"";position:absolute;top:0;left:0;right:0;height:3px}
-        .stat-card.stat-total::before{background:linear-gradient(90deg,#4facfe,#00f2fe)}
-        .stat-card.stat-success::before{background:linear-gradient(90deg,#43e97b,#38f9d7)}
-        .stat-card.stat-error::before{background:linear-gradient(90deg,#f093fb,#f5576c)}
-        .stat-card.stat-bandwidth::before{background:linear-gradient(90deg,#667eea,#764ba2)}
-        .stat-card:hover{transform:translateY(-4px);box-shadow:0 10px 40px rgba(0,0,0,0.5)}
-        .stat-icon{width:48px;height:48px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px}
-        .stat-card.stat-total .stat-icon{background:rgba(79,172,254,0.15)}
-        .stat-card.stat-success .stat-icon{background:rgba(67,233,123,0.15)}
-        .stat-card.stat-error .stat-icon{background:rgba(245,147,108,0.15)}
-        .stat-card.stat-bandwidth .stat-icon{background:rgba(102,126,234,0.15)}
-        .stat-label{color:var(--text-secondary);font-size:13px;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px}
-        .stat-value{font-size:32px;font-weight:700;line-height:1.2}
-        .stat-card.stat-total .stat-value{color:#4facfe}
-        .stat-card.stat-success .stat-value{color:#43e97b}
-        .stat-card.stat-error .stat-value{color:#f593fc}
-        .stat-card.stat-bandwidth .stat-value{color:#667eea}
-        .stat-trend{margin-top:12px;font-size:12px;color:var(--text-secondary)}
-        .tabs-nav{display:flex;gap:8px;padding:6px;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:16px;margin-bottom:24px}
-        .tab-btn{flex:0 0 auto;padding:12px 24px;background:transparent;border:none;border-radius:12px;color:var(--text-secondary);font-size:14px;font-weight:500;cursor:pointer;transition:all 0.3s}
-        .tab-btn:hover{color:var(--text-primary);background:rgba(31,41,55,0.6)}
-        .tab-btn.active{background:var(--accent-primary);color:white;box-shadow:0 4px 15px rgba(59,130,246,0.3)}
-        .panel-content{display:none}
-        .panel-content.active{display:block}
-        .card{background:var(--bg-card);backdrop-filter:blur(20px);border:1px solid var(--border-color);border-radius:20px;padding:24px;margin-bottom:20px}
-        .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border-color)}
-        .card-title{font-size:18px;font-weight:600}
-        .backend-list{display:flex;flex-direction:column;gap:12px}
-        .backend-item{display:flex;align-items:center;gap:16px;padding:20px;background:rgba(0,0,0,0.2);border:1px solid var(--border-color);border-radius:16px;transition:all 0.3s}
-        .backend-item:hover{border-color:var(--accent-primary);background:rgba(31,41,55,0.6)}
-        .backend-status{width:12px;height:12px;border-radius:50%;flex-shrink:0}
-        .backend-status.active{background:var(--success);box-shadow:0 0 20px rgba(16,185,129,0.4)}
-        .backend-status.inactive{background:var(--text-secondary)}
-        .backend-info{flex:1;min-width:0}
-        .backend-name{font-size:16px;font-weight:600;margin-bottom:4px}
-        .backend-url{font-size:13px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .backend-port{padding:6px 12px;background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);border-radius:8px;color:var(--accent-primary);font-size:13px;font-weight:600}
-        .btn-toggle{padding:8px 16px;background:transparent;border:1px solid var(--border-color);border-radius:10px;color:var(--text-secondary);font-size:13px;cursor:pointer;transition:all 0.3s}
-        .btn-toggle:hover{border-color:var(--accent-primary);color:var(--accent-primary)}
-        .btn-toggle.active{background:rgba(16,185,129,0.1);border-color:var(--success);color:var(--success)}
-        .btn-add{padding:12px 24px;background:linear-gradient(135deg,var(--success),#059669);border:none;border-radius:12px;color:white;font-size:14px;font-weight:600;cursor:pointer;transition:all 0.3s}
-        .btn-add:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(16,185,129,0.3)}
-        .btn-delete{padding:8px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:10px;color:var(--danger);font-size:13px;cursor:pointer;transition:all 0.3s}
-        .btn-delete:hover{background:rgba(239,68,68,0.2)}
-        .form-group{margin-bottom:20px}
-        .form-label{display:block;margin-bottom:8px;font-size:14px;font-weight:500;color:var(--text-secondary)}
-        .form-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-        .ip-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
-        .ip-tag{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);border-radius:10px;font-size:13px;color:var(--text-primary)}
-        .ip-tag .remove-ip{cursor:pointer;color:var(--text-secondary);transition:color 0.2s}
-        .ip-tag .remove-ip:hover{color:var(--danger)}
-        .ip-input-group{display:flex;gap:10px;margin-top:16px}
-        .ip-input-group input{flex:1;padding:12px 16px;background:rgba(0,0,0,0.3);border:1px solid var(--border-color);border-radius:12px;color:var(--text-primary);font-size:14px}
-        .ip-input-group input:focus{outline:none;border-color:var(--accent-primary)}
-        .log-list{display:flex;flex-direction:column;gap:10px;max-height:500px;overflow-y:auto}
-        .log-item{padding:16px;background:rgba(0,0,0,0.2);border-left:3px solid var(--danger);border-radius:12px;font-family:monospace;font-size:13px}
-        .log-time{color:var(--text-secondary);font-size:12px;margin-bottom:8px}
-        .log-error{color:var(--danger);margin-bottom:8px;word-break:break-all}
-        .log-details{color:var(--text-secondary);font-size:12px}
-        .empty-state{text-align:center;padding:60px 20px;color:var(--text-secondary)}
-        .empty-icon{font-size:48px;margin-bottom:16px;opacity:0.5}
-        .toast{position:fixed;bottom:24px;right:24px;padding:16px 24px;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,0.5);display:none;z-index:1000}
-        .toast.show{display:block}.toast.success{border-color:var(--success)}.toast.error{border-color:var(--danger)}
-        @media(max-width:768px){.dashboard-header{flex-direction:column;gap:16px;text-align:center}.header-right{flex-wrap:wrap;justify-content:center}.stats-overview{grid-template-columns:1fr}.form-row{grid-template-columns:1fr}}
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        
+        .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .login-box { background: #16213e; padding: 40px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
+        .login-box h1 { text-align: center; margin-bottom: 30px; color: #4ecca3; }
+        .login-box input { width: 100%; padding: 15px; margin: 10px 0; border: none; border-radius: 5px; background: #1a1a2e; color: #fff; font-size: 16px; }
+        .login-box button { width: 100%; padding: 15px; border: none; border-radius: 5px; background: #4ecca3; color: #1a1a2e; font-size: 16px; cursor: pointer; font-weight: bold; }
+        .login-box button:hover { background: #3db892; }
+        
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #333; }
+        .header h1 { color: #4ecca3; }
+        .header button { padding: 10px 20px; border: none; border-radius: 5px; background: #e94560; color: #fff; cursor: pointer; }
+        
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #16213e; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-card h3 { color: #888; font-size: 13px; margin-bottom: 8px; }
+        .stat-card .value { font-size: 28px; font-weight: bold; color: #4ecca3; }
+        .stat-card.error .value { color: #e94560; }
+        .stat-card.warning .value { color: #f0a500; }
+        
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        .tab { padding: 12px 24px; background: #16213e; border: none; border-radius: 5px; color: #888; cursor: pointer; font-size: 14px; }
+        .tab.active { background: #4ecca3; color: #1a1a2e; font-weight: bold; }
+        .tab:hover:not(.active) { background: #1f3460; }
+        
+        .panel { display: none; background: #16213e; border-radius: 10px; padding: 25px; }
+        .panel.active { display: block; }
+        
+        .section { margin-bottom: 30px; }
+        .section-title { font-size: 16px; color: #4ecca3; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #333; }
+        
+        .chart-row { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+        @media (max-width: 900px) { .chart-row { grid-template-columns: 1fr; } }
+        
+        .chart-box { background: #1a1a2e; border-radius: 8px; padding: 20px; }
+        .chart-box h4 { color: #888; font-size: 14px; margin-bottom: 15px; }
+        
+        .line-chart { height: 200px; position: relative; padding: 10px 0 40px 50px; }
+        .line-chart svg { width: 100%; height: 100%; }
+        .chart-line { fill: none; stroke: #4ecca3; stroke-width: 2; }
+        .chart-area { fill: url(#gradient); opacity: 0.3; }
+        .chart-label { font-size: 11px; fill: #888; }
+        
+        .pie-chart { display: flex; align-items: center; justify-content: center; gap: 20px; }
+        .pie-chart svg { width: 120px; height: 120px; }
+        .pie-legend { font-size: 12px; }
+        .pie-legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .pie-legend-color { width: 12px; height: 12px; border-radius: 2px; }
+        
+        .analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; }
+        .analysis-card { background: #1a1a2e; border-radius: 8px; padding: 15px; }
+        .analysis-card h4 { color: #888; font-size: 12px; margin-bottom: 10px; text-transform: uppercase; }
+        .analysis-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333; }
+        .analysis-item:last-child { border-bottom: none; }
+        .analysis-label { color: #aaa; }
+        .analysis-value { color: #4ecca3; font-weight: bold; }
+        
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #333; }
+        th { color: #4ecca3; font-weight: 600; font-size: 13px; }
+        tr:hover { background: rgba(78, 204, 163, 0.05); }
+        
+        .form-group { margin-bottom: 20px; }
+        .form-group label { display: block; margin-bottom: 8px; color: #888; }
+        .form-group input, .form-group select { width: 100%; padding: 12px; border: none; border-radius: 5px; background: #1a1a2e; color: #fff; font-size: 14px; }
+        .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
+        
+        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; margin-bottom: 5px; }
+        .btn-primary { background: #4ecca3; color: #1a1a2e; }
+        .btn-danger { background: #e94560; color: #fff; }
+        .btn-secondary { background: #333; color: #fff; }
+        .btn:hover { opacity: 0.9; }
+        
+        .status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; }
+        .status.online { background: #4ecca3; color: #1a1a2e; }
+        .status.offline { background: #e94560; color: #fff; }
+        
+        .log-entry { padding: 12px; border-left: 3px solid #e94560; background: rgba(233, 69, 96, 0.1); margin-bottom: 10px; border-radius: 0 5px 5px 0; }
+        .log-time { color: #888; font-size: 12px; }
+        .log-error { color: #e94560; margin-top: 5px; word-break: break-all; }
+        
+        .ip-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; }
+        .ip-item { background: #1a1a2e; padding: 8px 15px; border-radius: 20px; display: flex; align-items: center; gap: 10px; }
+        .ip-item button { background: none; border: none; color: #e94560; cursor: pointer; font-size: 18px; }
+        
+        .alert { padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .alert-warning { background: rgba(233, 69, 96, 0.2); border: 1px solid #e94560; color: #e94560; }
+        .alert-info { background: rgba(78, 204, 163, 0.1); border: 1px solid #4ecca3; color: #4ecca3; }
+        
+        .progress-bar { height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-top: 5px; }
+        .progress-fill { height: 100%; background: #4ecca3; border-radius: 4px; transition: width 0.3s; }
+        
+        /* 使用说明样式 */
+        .guide-section { margin-bottom: 25px; }
+        .guide-section h4 { color: #4ecca3; margin-bottom: 12px; font-size: 15px; }
+        .guide-section p { color: #aaa; line-height: 1.8; margin-bottom: 10px; }
+        .guide-section ul { color: #aaa; line-height: 1.8; margin-left: 20px; }
+        .guide-section li { margin-bottom: 5px; }
+        .guide-section code { background: #1a1a2e; padding: 2px 8px; border-radius: 4px; color: #4ecca3; font-family: 'Consolas', monospace; }
+        .guide-section pre { background: #1a1a2e; padding: 15px; border-radius: 8px; overflow-x: auto; margin: 10px 0; }
+        .guide-section pre code { background: none; padding: 0; }
+        .guide-tip { background: rgba(78, 204, 163, 0.1); border-left: 3px solid #4ecca3; padding: 12px 15px; margin: 15px 0; border-radius: 0 5px 5px 0; }
+        .guide-warning { background: rgba(233, 69, 96, 0.1); border-left: 3px solid #e94560; padding: 12px 15px; margin: 15px 0; border-radius: 0 5px 5px 0; }
+        
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .form-row { grid-template-columns: 1fr; }
+            table { font-size: 14px; }
+            th, td { padding: 10px; }
+        }
     </style>
 </head>
 <body>
-<div class="container">
-<div id="loginPage" class="login-wrapper"><div class="login-card"><div class="login-logo">🎬</div><h1 class="login-title">Emby 反代管理</h1><p class="login-subtitle">请输入管理员密码进行登录</p><form id="loginForm"><input type="password" id="passwordInput" class="form-input" placeholder="管理员密码" required><button type="submit" class="btn-primary">登 录</button></form></div></div>
-<div id="dashboardPage" style="display:none"><div class="dashboard-header"><div class="header-left"><h1>🎬 Emby 反代管理面板</h1><p>实时监控 · 智能调度 · 高效稳定</p></div><div class="header-right"><div class="server-status"><span class="status-dot"></span><span>服务运行正常</span></div><button class="btn-logout" onclick="logout()">退出登录</button></div></div>
-<div class="stats-overview"><div class="stat-card stat-total"><div class="stat-icon">📊</div><div class="stat-label">总请求数</div><div class="stat-value" id="statTotal">0</div><div class="stat-trend">今日实时数据</div></div><div class="stat-card stat-success"><div class="stat-icon">✅</div><div class="stat-label">成功请求</div><div class="stat-value" id="statSuccess">0</div><div class="stat-trend">成功率：<strong id="statRate">0%</strong></div></div><div class="stat-card stat-error"><div class="stat-icon">⚠️</div><div class="stat-label">错误次数</div><div class="stat-value" id="statError">0</div><div class="stat-trend">错误率：<strong id="statErrorRate">0%</strong></div></div><div class="stat-card stat-bandwidth"><div class="stat-icon">💾</div><div class="stat-label">流量统计</div><div class="stat-value" id="statBandwidth">0 GB</div><div class="stat-trend">今日累计</div></div></div>
-<div class="tabs-nav"><button class="tab-btn active" data-tab="backends">🖥️ 后端配置</button><button class="tab-btn" data-tab="access">🔒 访问控制</button><button class="tab-btn" data-tab="logs">📋 错误日志</button></div>
-<div id="panel-backends" class="panel-content active"><div class="card"><div class="card-header"><h2 class="card-title">🖥️ 后端服务器列表</h2><button class="btn-add" onclick="showAddBackend()">+ 添加后端</button></div><div id="backendList" class="backend-list"></div></div><div id="backendFormCard" class="card" style="display:none"><div class="card-header"><h2 class="card-title">➕ 添加后端服务器</h2></div><form id="backendForm"><input type="hidden" id="editPort"><div class="form-row"><div class="form-group"><label class="form-label">端口</label><input type="text" id="formPort" class="form-input" required></div><div class="form-group"><label class="form-label">名称</label><input type="text" id="formName" class="form-input" required></div></div><div class="form-group"><label class="form-label">后端地址</label><input type="url" id="formUrl" class="form-input" required></div><div style="display:flex;gap:12px"><button type="submit" class="btn-add">保存</button><button type="button" class="btn-toggle" onclick="hideBackendForm()">取消</button></div></form></div></div>
-<div id="panel-access" class="panel-content"><div class="card"><div class="card-header"><h2 class="card-title">🔒 IP 访问控制</h2></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:24px"><div><h3 style="margin-bottom:12px;font-size:15px;color:var(--text-secondary)">白名单 IP</h3><div id="whitelistDisplay" class="ip-list"></div><div class="ip-input-group"><input type="text" id="whitelistInput" placeholder="输入 IP"><button class="btn-add" onclick="addIP('whitelist')">添加</button></div></div><div><h3 style="margin-bottom:12px;font-size:15px;color:var(--text-secondary)">黑名单 IP</h3><div id="blacklistDisplay" class="ip-list"></div><div class="ip-input-group"><input type="text" id="blacklistInput" placeholder="输入 IP"><button class="btn-add" style="background:linear-gradient(135deg,var(--danger),#dc2626)" onclick="addIP('blacklist')">添加</button></div></div></div></div></div>
-<div id="panel-logs" class="panel-content"><div class="card"><div class="card-header"><h2 class="card-title">📋 错误日志</h2><button class="btn-delete" onclick="clearLogs()">清空</button></div><div id="logList" class="log-list"></div></div></div>
-</div></div>
-<div id="toast" class="toast"></div>
-<script>
-let token=localStorage.getItem('admin_token'),backends={},whitelist=[],blacklist=[];
-function showToast(m,t='success'){const e=document.getElementById('toast');e.textContent=m;e.className='toast show '+t;setTimeout(()=>e.className='toast',3000)}
-function formatBytes(b){if(!b||b===0)return'0 B';const k=1024,s=['B','KB','MB','GB','TB'],i=Math.floor(Math.log(b)/Math.log(k));return(b/Math.pow(k,i)).toFixed(2)+' '+s[i]}
-document.querySelectorAll('.tab-btn').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('.tab-btn').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.panel-content').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById('panel-'+b.dataset.tab).classList.add('active')})});
-document.getElementById('loginForm').addEventListener('submit',async e=>{e.preventDefault();const p=document.getElementById('passwordInput').value;try{const r=await fetch('/admin/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const d=await r.json();if(d.success){token=d.token;localStorage.setItem('admin_token',token);showDashboard()}else showToast(d.error||'密码错误','error')}catch(err){showToast('登录失败:'+err.message,'error')}});
-function logout(){localStorage.removeItem('admin_token');token=null;document.getElementById('loginPage').style.display='flex';document.getElementById('dashboardPage').style.display='none'}
-async function showDashboard(){document.getElementById('loginPage').style.display='none';document.getElementById('dashboardPage').style.display='block';await loadStats();await loadBackends();await loadAccessConfig();await loadLogs()}
-async function loadStats(){try{const r=await fetch('/admin/api/stats',{headers:{'Authorization':'Bearer '+token}});const d=await r.json();if(d.today){document.getElementById('statTotal').textContent=d.today.total.toLocaleString();document.getElementById('statSuccess').textContent=d.today.success.toLocaleString();document.getElementById('statError').textContent=d.today.error.toLocaleString();document.getElementById('statBandwidth').textContent=formatBytes(d.today.bytes);const rt=d.today.total>0?((d.today.success/d.today.total)*100).toFixed(1):0;const er=d.today.total>0?((d.today.error/d.today.total)*100).toFixed(1):0;document.getElementById('statRate').textContent=rt+'%';document.getElementById('statErrorRate').textContent=er+'%'}}catch(e){console.error(e)}}
-async function loadBackends(){try{const r=await fetch('/admin/api/backends',{headers:{'Authorization':'Bearer '+token}});backends=await r.json();renderBackends()}catch(e){showToast('加载失败','error')}}
-function renderBackends(){const c=document.getElementById('backendList'),p=Object.keys(backends);if(p.length===0){c.innerHTML='<div class="empty-state"><div class="empty-icon">📭</div><p>暂无配置</p></div>';return}c.innerHTML=p.map(port=>{const b=backends[port];return'<div class="backend-item"><div class="backend-status '+(b.enabled?'active':'inactive')+'"></div><div class="backend-info"><div class="backend-name">'+(b.name||'未命名')+'</div><div class="backend-url">'+b.url+'</div></div><span class="backend-port">'+port+'</span><button class="btn-toggle '+(b.enabled?'active':'')+'" onclick="toggleBackend(\''+port+'\')">'+(b.enabled?'已启用':'已禁用')+'</button><button class="btn-delete" onclick="deleteBackend(\''+port+'\')">删除</button></div>'}).join('')}
-function showAddBackend(){document.getElementById('backendFormCard').style.display='block';document.getElementById('backendForm').reset();document.getElementById('editPort').value=''}
-function hideBackendForm(){document.getElementById('backendFormCard').style.display='none'}
-document.getElementById('backendForm').addEventListener('submit',async e=>{e.preventDefault();const port=document.getElementById('formPort').value.trim(),name=document.getElementById('formName').value.trim(),url=document.getElementById('formUrl').value.trim(),editPort=document.getElementById('editPort').value;try{if(editPort&&editPort!==port)await fetch('/admin/api/backends',{method:'DELETE',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({port:editPort})});const res=await fetch('/admin/api/backends',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({port,name,url,enabled:true})});if(res.ok){showToast('保存成功');hideBackendForm();loadBackends()}else showToast('失败','error')}catch(err){showToast('错误:'+err.message,'error')}}
-async function toggleBackend(port){try{const res=await fetch('/admin/api/backends/toggle',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({port})});if(res.ok){showToast('已更新');loadBackends()}}catch(err){showToast('失败','error')}}
-async function deleteBackend(port){if(!confirm('确定删除？'))return;try{const res=await fetch('/admin/api/backends',{method:'DELETE',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({port})});if(res.ok){showToast('已删除');loadBackends()}}catch(err){showToast('失败','error')}}
-async function loadAccessConfig(){try{const res=await fetch('/admin/api/access',{headers:{'Authorization':'Bearer '+token}});const d=await res.json();whitelist=d.whitelist||[];blacklist=d.blacklist||[];renderAccessConfig()}catch(e){console.error(e)}}
-function renderAccessConfig(){document.getElementById('whitelistDisplay').innerHTML=whitelist.map(ip=>'<span class="ip-tag">'+ip+' <span class="remove-ip" onclick="removeIP(\'whitelist\',\''+ip+'\')">x</span></span>').join('')||'<span style="color:var(--text-secondary);font-size:13px">暂无</span>';document.getElementById('blacklistDisplay').innerHTML=blacklist.map(ip=>'<span class="ip-tag" style="background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.2)">'+ip+' <span class="remove-ip" onclick="removeIP(\'blacklist\',\''+ip+'\')">x</span></span>').join('')||'<span style="color:var(--text-secondary);font-size:13px">暂无</span>'}
-async function addIP(type){const input=document.getElementById(type+'Input'),ip=input.value.trim();if(!ip){showToast('请输入 IP','error');return}try{const res=await fetch('/admin/api/access',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({type,action:'add',ip})});if(res.ok){showToast('添加成功');input.value='';loadAccessConfig()}}catch(err){showToast('失败','error')}}
-async function removeIP(type,ip){try{const res=await fetch('/admin/api/access',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({type,action:'remove',ip})});if(res.ok){showToast('已移除');loadAccessConfig()}}catch(err){showToast('失败','error')}}
-async function loadLogs(){try{const res=await fetch('/admin/api/logs',{headers:{'Authorization':'Bearer '+token}});const logs=await res.json();renderLogs(logs)}catch(e){console.error(e)}}
-function renderLogs(logs){const c=document.getElementById('logList');if(!logs||logs.length===0){c.innerHTML='<div class="empty-state"><div class="empty-icon">📭</div><p>暂无日志</p></div>';return}c.innerHTML=logs.map(log=>'<div class="log-item"><div class="log-time">'+new Date(log.time).toLocaleString('zh-CN')+'</div><div class="log-error">'+(log.error||'Error')+'</div><div class="log-details">端口:'+(log.port||'N/A')+' | URL:'+(log.url||'N/A')+'</div></div>').join('')}
-async function clearLogs(){if(!confirm('确定清空？'))return;try{const res=await fetch('/admin/api/logs/clear',{method:'POST',headers:{'Authorization':'Bearer '+token}});if(res.ok){showToast('已清空');loadLogs()}}catch(err){showToast('失败','error')}}
-if(token)showDashboard();
-</script>
+    <div id="loginPage" class="login-container">
+        <div class="login-box">
+            <h1>🔐 管理登录</h1>
+            <input type="password" id="password" placeholder="请输入管理员密码" onkeypress="if(event.key==='Enter')login()">
+            <button onclick="login()">登 录</button>
+            <p id="loginError" style="color: #e94560; text-align: center; margin-top: 15px;"></p>
+        </div>
+    </div>
+    
+    <div id="mainPage" class="container" style="display: none;">
+        <div class="header">
+            <h1>🎬 Emby 反代管理面板</h1>
+            <button onclick="logout()">退出登录</button>
+        </div>
+        
+        <div id="kvWarning" class="alert alert-warning" style="display: none;">
+            ⚠️ KV 未配置，统计和管理功能不可用。请先创建 KV 命名空间并绑定到 Worker。
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>今日请求</h3>
+                <div class="value" id="todayTotal">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>成功率</h3>
+                <div class="value" id="successRate">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>今日流量</h3>
+                <div class="value" id="todayBytes">-</div>
+            </div>
+            <div class="stat-card error">
+                <h3>今日错误</h3>
+                <div class="value" id="todayErrors">-</div>
+            </div>
+            <div class="stat-card warning">
+                <h3>平均响应</h3>
+                <div class="value" id="avgDuration">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>峰值 QPS</h3>
+                <div class="value" id="peakQps">-</div>
+            </div>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="showPanel('dashboard')">📊 仪表盘</button>
+            <button class="tab" onclick="showPanel('backends')">🖥️ 后端管理</button>
+            <button class="tab" onclick="showPanel('access')">🛡️ 访问控制</button>
+            <button class="tab" onclick="showPanel('logs')">📋 错误日志</button>
+            <button class="tab" onclick="showPanel('guide')">📖 使用说明</button>
+        </div>
+        
+        <div id="dashboard" class="panel active">
+            <div class="section">
+                <h3 class="section-title">📈 近7天请求趋势</h3>
+                <div class="chart-row">
+                    <div class="chart-box">
+                        <h4>请求量趋势</h4>
+                        <div class="line-chart" id="lineChart"></div>
+                    </div>
+                    <div class="chart-box">
+                        <h4>流量分布</h4>
+                        <div class="pie-chart" id="pieChart"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h3 class="section-title">📊 专业分析</h3>
+                <div class="analysis-grid">
+                    <div class="analysis-card">
+                        <h4>请求分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天总请求</span>
+                            <span class="analysis-value" id="weekTotal">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">日均请求</span>
+                            <span class="analysis-value" id="dailyAvg">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天成功率</span>
+                            <span class="analysis-value" id="weekSuccessRate">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">请求趋势</span>
+                            <span class="analysis-value" id="trend">-</span>
+                        </div>
+                    </div>
+                    <div class="analysis-card">
+                        <h4>流量分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天总流量</span>
+                            <span class="analysis-value" id="weekBytes">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">日均流量</span>
+                            <span class="analysis-value" id="dailyBytesAvg">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">平均请求大小</span>
+                            <span class="analysis-value" id="avgRequestSize">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">峰值流量日</span>
+                            <span class="analysis-value" id="peakDay">-</span>
+                        </div>
+                    </div>
+                    <div class="analysis-card">
+                        <h4>性能分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">平均响应时间</span>
+                            <span class="analysis-value" id="avgResponseTime">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">健康状态</span>
+                            <span class="analysis-value" id="healthStatus">-</span>
+                        </div>
+                    </div>
+                    <div class="analysis-card">
+                        <h4>错误分析</h4>
+                        <div class="analysis-item">
+                            <span class="analysis-label">7天总错误</span>
+                            <span class="analysis-value" id="weekErrors">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">错误率</span>
+                            <span class="analysis-value" id="errorRate">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">错误趋势</span>
+                            <span class="analysis-value" id="errorTrend">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h3 class="section-title">🔌 各端口统计</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>端口</th>
+                            <th>名称</th>
+                            <th>今日请求</th>
+                            <th>成功率</th>
+                            <th>今日流量</th>
+                            <th>平均响应</th>
+                            <th>状态</th>
+                        </tr>
+                    </thead>
+                    <tbody id="portStats"></tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="backends" class="panel">
+            <h3 style="margin-bottom: 20px;">后端服务器配置</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>端口</th>
+                        <th>名称</th>
+                        <th>后端地址</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="backendList"></tbody>
+            </table>
+            
+            <h3 style="margin: 30px 0 20px;">添加/编辑后端</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>端口</label>
+                    <input type="text" id="backendPort" placeholder="如: 8443">
+                </div>
+                <div class="form-group">
+                    <label>名称</label>
+                    <input type="text" id="backendName" placeholder="如: Emby Server 1">
+                </div>
+                <div class="form-group">
+                    <label>后端地址</label>
+                    <input type="text" id="backendUrl" placeholder="https://example.com:port">
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="saveBackend()">保存配置</button>
+            <button class="btn btn-secondary" onclick="resetBackends()">恢复默认</button>
+        </div>
+        
+        <div id="access" class="panel">
+            <h3 style="margin-bottom: 20px;">访问控制</h3>
+            
+            <div class="form-group">
+                <label>黑名单IP（禁止访问）</label>
+                <div class="form-row">
+                    <input type="text" id="blacklistIP" placeholder="输入IP地址" style="flex: 1;">
+                    <button class="btn btn-danger" onclick="addBlacklist()">添加</button>
+                </div>
+                <div class="ip-list" id="blacklist"></div>
+            </div>
+            
+            <div class="form-group" style="margin-top: 30px;">
+                <label>白名单IP（仅允许这些IP访问，留空则允许所有）</label>
+                <div class="form-row">
+                    <input type="text" id="whitelistIP" placeholder="输入IP地址" style="flex: 1;">
+                    <button class="btn btn-primary" onclick="addWhitelist()">添加</button>
+                </div>
+                <div class="ip-list" id="whitelist"></div>
+            </div>
+            
+            <p style="color: #888; margin-top: 20px;">💡 提示：白名单优先级高于黑名单。设置白名单后，只有白名单中的IP可以访问。</p>
+        </div>
+        
+        <div id="logs" class="panel">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3>错误日志</h3>
+                <div>
+                    <button class="btn btn-secondary" onclick="refreshLogs()">刷新</button>
+                    <button class="btn btn-danger" onclick="clearLogs()">清除全部</button>
+                </div>
+            </div>
+            <div id="errorLogs"></div>
+        </div>
+        
+        <div id="guide" class="panel">
+            <h3 style="margin-bottom: 25px;">📖 使用说明</h3>
+            
+            <div class="guide-section">
+                <h4>一、部署 Worker</h4>
+                <p>1. 登录 <a href="https://dash.cloudflare.com" target="_blank" style="color: #4ecca3;">Cloudflare Dashboard</a></p>
+                <p>2. 左侧菜单选择 <strong>Workers & Pages</strong></p>
+                <p>3. 点击 <strong>Create Worker</strong> 创建新 Worker</p>
+                <p>4. 将本代码完整复制到编辑器中</p>
+                <p>5. 点击 <strong>Save and Deploy</strong> 部署</p>
+                <div class="guide-tip">
+                    💡 部署后会获得一个默认域名：<code>你的worker名.你的账户.workers.dev</code>
+                </div>
+            </div>
+            
+            <div class="guide-section">
+                <h4>二、创建并绑定 KV</h4>
+                <p>KV 用于存储统计数据、错误日志和配置信息。</p>
+                <p><strong>步骤 1：创建 KV 命名空间</strong></p>
+                <ul>
+                    <li>左侧菜单 <strong>Workers & Pages</strong> → <strong>KV</strong></li>
+                    <li>点击 <strong>Create a namespace</strong></li>
+                    <li>输入名称：<code>EMBY_KV</code></li>
+                    <li>点击 <strong>Add</strong></li>
+                </ul>
+                <p><strong>步骤 2：绑定 KV 到 Worker</strong></p>
+                <ul>
+                    <li>进入你的 Worker → <strong>Settings</strong> → <strong>Variables</strong></li>
+                    <li>点击 <strong>Add variable</strong> → 选择 <strong>KV Namespace</strong></li>
+                    <li>Variable name 填写：<code>EMBY_KV</code>（必须完全一致）</li>
+                    <li>Value 选择刚创建的 KV 命名空间</li>
+                    <li>点击 <strong>Save</strong></li>
+                </ul>
+                <div class="guide-warning">
+                    ⚠️ 绑定 KV 后，必须重新部署 Worker 才能生效！
+                </div>
+            </div>
+            
+            <div class="guide-section">
+                <h4>三、绑定自定义域名</h4>
+                <p>使用自己的域名替代默认的 workers.dev 域名。</p>
+                <p><strong>前提条件</strong>：域名已托管到 Cloudflare</p>
+                <p><strong>步骤</strong>：</p>
+                <ul>
+                    <li>进入 Worker → <strong>Settings</strong> → <strong>Triggers</strong></li>
+                    <li>点击 <strong>Add Custom Domain</strong></li>
+                    <li>输入你的域名，如：<code>emby.你的域名.com</code></li>
+                    <li>点击 <strong>Add Custom Domain</strong></li>
+                </ul>
+                <div class="guide-tip">
+                    💡 Cloudflare 会自动配置 DNS 记录，无需手动添加。
+                </div>
+            </div>
+            
+            <div class="guide-section">
+                <h4>四、添加优选域名 CNAME（推荐）</h4>
+                <p>通过 CNAME 绑定优选域名，可以获得更好的访问速度。</p>
+                <p><strong>以绑定 saas.sin.fan 为例</strong>：</p>
+                <ul>
+                    <li>进入 Cloudflare <strong>DNS</strong> 管理页面</li>
+                    <li>点击 <strong>Add record</strong> 添加记录</li>
+                    <li>配置如下：
+                        <pre><code>类型：CNAME
+名称：emby（或其他你想要的子域名）
+目标：saas.sin.fan
+代理状态：仅DNS（必须关闭橙色云朵）</code></pre>
+                    </li>
+                    <li>点击 <strong>Save</strong> 保存</li>
+                </ul>
+                <p><strong>然后在 Worker 中绑定该域名</strong>：</p>
+                <ul>
+                    <li>Worker → <strong>Settings</strong> → <strong>Triggers</strong></li>
+                    <li><strong>Add Custom Domain</strong> → 输入 <code>emby.你的域名.com</code></li>
+                </ul>
+                <div class="guide-tip">
+                    💡 这样用户访问 <code>emby.你的域名.com</code> 时，会通过 Cloudflare 优选节点访问，速度更快。
+                </div>
+            </div>
+            
+            <div class="guide-section">
+                <h4>五、配置后端服务器</h4>
+                <p>1. 访问管理面板：<code>https://你的域名/admin</code></p>
+                <p>2. 默认密码：<code>admin123</code>（请及时修改代码中的 ADMIN_PASSWORD）</p>
+                <p>3. 在「后端管理」中添加你的 Emby 服务器地址</p>
+                <p>4. 点击「复制地址」获取反代地址，分享给用户使用</p>
+            </div>
+            
+            <div class="guide-section">
+                <h4>六、多端口说明</h4>
+                <p>本系统支持根据访问端口自动路由到不同的后端服务器：</p>
+                <table style="margin-top: 10px;">
+                    <thead>
+                        <tr>
+                            <th>访问端口</th>
+                            <th>说明</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>默认（443）</td>
+                            <td>使用 default 后端配置</td>
+                        </tr>
+                        <tr>
+                            <td>8443</td>
+                            <td>使用端口 8443 对应的后端</td>
+                        </tr>
+                        <tr>
+                            <td>2053</td>
+                            <td>使用端口 2053 对应的后端</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <div class="guide-warning">
+                    ⚠️ 使用非标准端口时，需要在 Cloudflare 中配置并开启该端口的 HTTPS 支持。<br>
+                    Cloudflare 支持的 HTTPS 端口：443, 2053, 2083, 2087, 2096, 8443
+                </div>
+            </div>
+            
+            <div class="guide-section">
+                <h4>七、常见问题</h4>
+                <p><strong>Q: 为什么提示 "KV 未配置"？</strong></p>
+                <p>A: 请确保已正确绑定 KV，并且变量名完全为 <code>EMBY_KV</code>，绑定后需重新部署。</p>
+                
+                <p><strong>Q: 为什么出现 429 错误？</strong></p>
+                <p>A: KV 写入频率超限。免费版每天 1000 次写入，本系统已优化为每 30 秒写入一次。</p>
+                
+                <p><strong>Q: 如何修改管理员密码？</strong></p>
+                <p>A: 修改代码第 9 行的 <code>ADMIN_PASSWORD</code> 值，然后重新部署。</p>
+                
+                <p><strong>Q: 为什么无法访问后端？</strong></p>
+                <p>A: 检查后端地址是否正确，确保后端服务器可被 Cloudflare 访问（非内网地址）。</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let token = localStorage.getItem('admin_token') || '';
+        let kvAvailable = true;
+        let statsData = null;
+        
+        async function init() {
+            if (token) {
+                document.getElementById('loginPage').style.display = 'none';
+                document.getElementById('mainPage').style.display = 'block';
+                await loadDashboard();
+            }
+        }
+        
+        async function login() {
+            const password = document.getElementById('password').value;
+            try {
+                const res = await fetch('/admin/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    token = data.token;
+                    localStorage.setItem('admin_token', token);
+                    document.getElementById('loginPage').style.display = 'none';
+                    document.getElementById('mainPage').style.display = 'block';
+                    await loadDashboard();
+                } else {
+                    document.getElementById('loginError').textContent = data.error || '登录失败';
+                }
+            } catch (e) {
+                document.getElementById('loginError').textContent = '网络错误';
+            }
+        }
+        
+        function logout() {
+            token = '';
+            localStorage.removeItem('admin_token');
+            document.getElementById('loginPage').style.display = 'flex';
+            document.getElementById('mainPage').style.display = 'none';
+        }
+        
+        function showPanel(name) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(name).classList.add('active');
+            
+            if (name === 'access') loadAccessControl();
+            if (name === 'logs') refreshLogs();
+        }
+        
+        async function loadDashboard() {
+            try {
+                const res = await fetch('/admin/api/stats', {
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                const data = await res.json();
+                statsData = data;
+                
+                if (data.kvWarning) {
+                    kvAvailable = false;
+                    document.getElementById('kvWarning').style.display = 'block';
+                }
+                
+                if (data.today) {
+                    document.getElementById('todayTotal').textContent = data.today.total.toLocaleString();
+                    const rate = data.today.total > 0 ? ((data.today.success / data.today.total) * 100).toFixed(1) : 0;
+                    document.getElementById('successRate').textContent = rate + '%';
+                    document.getElementById('todayBytes').textContent = formatBytes(data.today.bytes);
+                    document.getElementById('todayErrors').textContent = data.today.error;
+                    
+                    const avgDuration = data.today.total > 0 ? (data.today.duration / data.today.total).toFixed(0) : 0;
+                    document.getElementById('avgDuration').textContent = avgDuration + 'ms';
+                }
+                
+                renderLineChart(data.history || []);
+                renderPieChart(data.today, data.backends);
+                renderAnalysis(data.history || [], data.today);
+                renderPortStats(data.today, data.backends);
+                renderBackendList(data.backends);
+            } catch (e) {
+                console.error('加载仪表盘失败', e);
+            }
+        }
+        
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+        
+        function renderLineChart(history) {
+            const container = document.getElementById('lineChart');
+            if (!history.length) {
+                container.innerHTML = '<p style="color: #888; text-align: center; padding: 50px;">暂无数据</p>';
+                return;
+            }
+            
+            const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+            const maxTotal = Math.max(...sorted.map(h => h.total), 1);
+            const width = 100;
+            const height = 80;
+            const padding = 5;
+            
+            let points = '';
+            let areaPoints = '';
+            let labels = '';
+            
+            sorted.forEach((h, i) => {
+                const x = padding + (i / (sorted.length - 1 || 1)) * (width - padding * 2);
+                const y = height - padding - (h.total / maxTotal) * (height - padding * 2);
+                points += (i === 0 ? 'M' : 'L') + x + ',' + y;
+                areaPoints += (i === 0 ? 'M' : 'L') + x + ',' + y;
+                if (i === sorted.length - 1) areaPoints += 'L' + x + ',' + (height - padding) + 'L' + padding + ',' + (height - padding) + 'Z';
+                labels += '<text x="' + x + '" y="' + (height + 3) + '" class="chart-label" text-anchor="middle">' + h.date.slice(5) + '</text>';
+            });
+            
+            container.innerHTML = '<svg viewBox="0 0 ' + width + ' ' + (height + 20) + '" preserveAspectRatio="xMidYMid meet">' +
+                '<defs><linearGradient id="gradient" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#4ecca3"/><stop offset="100%" stop-color="#4ecca300"/></linearGradient></defs>' +
+                '<path d="' + areaPoints + '" class="chart-area"/>' +
+                '<path d="' + points + '" class="chart-line"/>' +
+                labels +
+            '</svg>';
+        }
+        
+        function renderPieChart(today, backends) {
+            const container = document.getElementById('pieChart');
+            if (!today || !today.ports || Object.keys(today.ports).length === 0) {
+                container.innerHTML = '<p style="color: #888;">暂无数据</p>';
+                return;
+            }
+            
+            const colors = ['#4ecca3', '#3db892', '#2ca58d', '#1b9178', '#0a7d63'];
+            const ports = Object.entries(today.ports);
+            const total = ports.reduce((sum, [, p]) => sum + p.bytes, 0);
+            
+            let cumulativePercent = 0;
+            let paths = '';
+            let legend = '';
+            
+            ports.forEach(([port, data], i) => {
+                const percent = total > 0 ? (data.bytes / total) : 0;
+                const startAngle = cumulativePercent * 2 * Math.PI;
+                const endAngle = (cumulativePercent + percent) * 2 * Math.PI;
+                
+                if (percent > 0) {
+                    const x1 = 50 + 40 * Math.sin(startAngle);
+                    const y1 = 50 - 40 * Math.cos(startAngle);
+                    const x2 = 50 + 40 * Math.sin(endAngle);
+                    const y2 = 50 - 40 * Math.cos(endAngle);
+                    const largeArc = percent > 0.5 ? 1 : 0;
+                    
+                    paths += '<path d="M50,50 L' + x1 + ',' + y1 + ' A40,40 0 ' + largeArc + ',1 ' + x2 + ',' + y2 + ' Z" fill="' + colors[i % colors.length] + '"/>';
+                }
+                
+                cumulativePercent += percent;
+                
+                const backend = backends[port] || {};
+                legend += '<div class="pie-legend-item">' +
+                    '<div class="pie-legend-color" style="background:' + colors[i % colors.length] + '"></div>' +
+                    '<span>' + (backend.name || port) + ': ' + formatBytes(data.bytes) + '</span>' +
+                '</div>';
+            });
+            
+            container.innerHTML = '<svg viewBox="0 0 100 100">' + paths + '</svg><div class="pie-legend">' + legend + '</div>';
+        }
+        
+        function renderAnalysis(history, today) {
+            if (!history.length) {
+                document.getElementById('weekTotal').textContent = '-';
+                document.getElementById('dailyAvg').textContent = '-';
+                document.getElementById('weekSuccessRate').textContent = '-';
+                document.getElementById('trend').textContent = '-';
+                document.getElementById('weekBytes').textContent = '-';
+                document.getElementById('dailyBytesAvg').textContent = '-';
+                document.getElementById('avgRequestSize').textContent = '-';
+                document.getElementById('peakDay').textContent = '-';
+                return;
+            }
+            
+            const weekTotal = history.reduce((sum, h) => sum + h.total, 0);
+            const weekSuccess = history.reduce((sum, h) => sum + h.success, 0);
+            const weekErrors = history.reduce((sum, h) => sum + h.error, 0);
+            const weekBytes = history.reduce((sum, h) => sum + h.bytes, 0);
+            const weekDuration = history.reduce((sum, h) => sum + (h.duration || 0), 0);
+            
+            document.getElementById('weekTotal').textContent = weekTotal.toLocaleString();
+            document.getElementById('dailyAvg').textContent = Math.round(weekTotal / history.length).toLocaleString();
+            document.getElementById('weekSuccessRate').textContent = weekTotal > 0 ? ((weekSuccess / weekTotal) * 100).toFixed(1) + '%' : '-';
+            
+            if (history.length >= 2) {
+                const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+                const recent = sorted.slice(-3).reduce((s, h) => s + h.total, 0);
+                const previous = sorted.slice(-6, -3).reduce((s, h) => s + h.total, 0);
+                const trendPercent = previous > 0 ? ((recent - previous) / previous * 100).toFixed(0) : 0;
+                document.getElementById('trend').textContent = (trendPercent >= 0 ? '↑' : '↓') + Math.abs(trendPercent) + '%';
+                document.getElementById('trend').style.color = trendPercent >= 0 ? '#4ecca3' : '#e94560';
+            }
+            
+            document.getElementById('weekBytes').textContent = formatBytes(weekBytes);
+            document.getElementById('dailyBytesAvg').textContent = formatBytes(weekBytes / history.length);
+            document.getElementById('avgRequestSize').textContent = weekTotal > 0 ? formatBytes(weekBytes / weekTotal) : '-';
+            
+            const peakDay = history.reduce((max, h) => h.bytes > max.bytes ? h : max, history[0]);
+            document.getElementById('peakDay').textContent = peakDay.date;
+            
+            document.getElementById('avgResponseTime').textContent = weekTotal > 0 ? (weekDuration / weekTotal).toFixed(0) + 'ms' : '-';
+            
+            const errorRate = weekTotal > 0 ? (weekErrors / weekTotal * 100) : 0;
+            let health = '优秀', healthColor = '#4ecca3';
+            if (errorRate > 10) { health = '警告'; healthColor = '#f0a500'; }
+            if (errorRate > 30) { health = '异常'; healthColor = '#e94560'; }
+            document.getElementById('healthStatus').textContent = health;
+            document.getElementById('healthStatus').style.color = healthColor;
+            
+            document.getElementById('weekErrors').textContent = weekErrors.toLocaleString();
+            document.getElementById('errorRate').textContent = errorRate.toFixed(2) + '%';
+            
+            if (history.length >= 2) {
+                const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+                const recentErrors = sorted.slice(-3).reduce((s, h) => s + h.error, 0);
+                const previousErrors = sorted.slice(-6, -3).reduce((s, h) => s + h.error, 0);
+                const errorTrend = previousErrors > 0 ? ((recentErrors - previousErrors) / previousErrors * 100).toFixed(0) : 0;
+                document.getElementById('errorTrend').textContent = (errorTrend >= 0 ? '↑' : '↓') + Math.abs(errorTrend) + '%';
+                document.getElementById('errorTrend').style.color = errorTrend <= 0 ? '#4ecca3' : '#e94560';
+            }
+        }
+        
+        function renderPortStats(today, backends) {
+            const tbody = document.getElementById('portStats');
+            const ports = Object.keys(backends || {});
+            if (!today || !today.ports) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #888;">暂无数据</td></tr>';
+                return;
+            }
+            tbody.innerHTML = ports.map(port => {
+                const backend = backends[port];
+                const stats = today.ports[port] || { total: 0, success: 0, error: 0, bytes: 0 };
+                const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0;
+                const avgDuration = stats.total > 0 ? Math.round((today.duration || 0) / today.total) : 0;
+                return '<tr>' +
+                    '<td>' + port + '</td>' +
+                    '<td>' + (backend.name || '-') + '</td>' +
+                    '<td>' + stats.total.toLocaleString() + '</td>' +
+                    '<td>' + rate + '%<div class="progress-bar"><div class="progress-fill" style="width:' + rate + '%"></div></div></td>' +
+                    '<td>' + formatBytes(stats.bytes) + '</td>' +
+                    '<td>' + avgDuration + 'ms</td>' +
+                    '<td><span class="status ' + (backend.enabled ? 'online' : 'offline') + '">' + (backend.enabled ? '启用' : '禁用') + '</span></td>' +
+                    '</tr>';
+            }).join('');
+        }
+        
+        function renderBackendList(backends) {
+            const tbody = document.getElementById('backendList');
+            tbody.innerHTML = Object.entries(backends || {}).map(([port, config]) => {
+                const proxyUrl = port === 'default' 
+                    ? window.location.origin 
+                    : window.location.origin.replace(/(:\\d+)?$/, ':' + port);
+                return '<tr>' +
+                    '<td>' + port + '</td>' +
+                    '<td>' + config.name + '</td>' +
+                    '<td style="word-break: break-all;">' + config.url + '</td>' +
+                    '<td><span class="status ' + (config.enabled ? 'online' : 'offline') + '">' + (config.enabled ? '启用' : '禁用') + '</span></td>' +
+                    '<td>' +
+                        '<button class="btn btn-primary" onclick="editBackend(\\'' + port + '\\')">编辑</button> ' +
+                        '<button class="btn ' + (config.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleBackend(\\'' + port + '\\')">' + (config.enabled ? '禁用' : '启用') + '</button> ' +
+                        '<button class="btn btn-secondary" onclick="copyProxyUrl(\\'' + proxyUrl + '\\')">复制地址</button> ' +
+                        '<button class="btn btn-danger" onclick="deleteBackend(\\'' + port + '\\')">删除</button>' +
+                    '</td>' +
+                    '</tr>';
+            }).join('');
+        }
+        
+        function copyProxyUrl(url) {
+            navigator.clipboard.writeText(url).then(() => {
+                const toast = document.createElement('div');
+                toast.textContent = '已复制: ' + url;
+                toast.style.cssText = 'position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #4ecca3; color: #1a1a2e; padding: 12px 24px; border-radius: 5px; font-weight: bold; z-index: 9999;';
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 2000);
+            }).catch(() => {
+                alert('复制失败，请手动复制: ' + url);
+            });
+        }
+        
+        function editBackend(port) {
+            fetch('/admin/api/backends', {
+                headers: { 'Authorization': 'Bearer ' + token }
+            })
+            .then(res => res.json())
+            .then(data => {
+                const backend = data[port];
+                if (backend) {
+                    document.getElementById('backendPort').value = port;
+                    document.getElementById('backendName').value = backend.name;
+                    document.getElementById('backendUrl').value = backend.url;
+                }
+            });
+        }
+        
+        async function saveBackend() {
+            const port = document.getElementById('backendPort').value.trim();
+            const name = document.getElementById('backendName').value.trim();
+            const url = document.getElementById('backendUrl').value.trim();
+            
+            if (!port || !name || !url) {
+                alert('请填写完整信息');
+                return;
+            }
+            
+            try {
+                const res = await fetch('/admin/api/backends', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + token
+                    },
+                    body: JSON.stringify({ port, name, url, enabled: true })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert('保存成功');
+                    loadDashboard();
+                    document.getElementById('backendPort').value = '';
+                    document.getElementById('backendName').value = '';
+                    document.getElementById('backendUrl').value = '';
+                } else {
+                    alert(data.error || '保存失败');
+                }
+            } catch (e) {
+                alert('网络错误');
+            }
+        }
+        
+        async function toggleBackend(port) {
+            try {
+                const res = await fetch('/admin/api/backends/toggle', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + token
+                    },
+                    body: JSON.stringify({ port })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    loadDashboard();
+                }
+            } catch (e) {}
+        }
+        
+        async function deleteBackend(port) {
+            if (!confirm('确定要删除此后端配置吗？')) return;
+            try {
+                const res = await fetch('/admin/api/backends', {
+                    method: 'DELETE',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + token
+                    },
+                    body: JSON.stringify({ port })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    loadDashboard();
+                }
+            } catch (e) {}
+        }
+        
+        async function resetBackends() {
+            if (!confirm('确定要恢复默认配置吗？这将覆盖当前所有后端配置。')) return;
+            try {
+                const res = await fetch('/admin/api/backends/reset', {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert('已恢复默认配置');
+                    loadDashboard();
+                }
+            } catch (e) {}
+        }
+        
+        async function loadAccessControl() {
+            try {
+                const res = await fetch('/admin/api/access', {
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                const data = await res.json();
+                
+                renderIPList('blacklist', data.blacklist || [], 'blacklist');
+                renderIPList('whitelist', data.whitelist || [], 'whitelist');
+            } catch (e) {}
+        }
+        
+        function renderIPList(elementId, ips, type) {
+            const container = document.getElementById(elementId);
+            container.innerHTML = ips.map(ip => 
+                '<div class="ip-item">' +
+                    '<span>' + ip + '</span>' +
+                    '<button onclick="removeIP(\\'' + type + '\\', \\'' + ip + '\\')">&times;</button>' +
+                '</div>'
+            ).join('') || '<span style="color: #888;">暂无</span>';
+        }
+        
+        async function addBlacklist() {
+            const ip = document.getElementById('blacklistIP').value.trim();
+            if (!ip) return;
+            await addIP('blacklist', ip);
+            document.getElementById('blacklistIP').value = '';
+        }
+        
+        async function addWhitelist() {
+            const ip = document.getElementById('whitelistIP').value.trim();
+            if (!ip) return;
+            await addIP('whitelist', ip);
+            document.getElementById('whitelistIP').value = '';
+        }
+        
+        async function addIP(type, ip) {
+            try {
+                const res = await fetch('/admin/api/access', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + token
+                    },
+                    body: JSON.stringify({ type, ip, action: 'add' })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    loadAccessControl();
+                }
+            } catch (e) {}
+        }
+        
+        async function removeIP(type, ip) {
+            try {
+                const res = await fetch('/admin/api/access', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + token
+                    },
+                    body: JSON.stringify({ type, ip, action: 'remove' })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    loadAccessControl();
+                }
+            } catch (e) {}
+        }
+        
+        async function refreshLogs() {
+            try {
+                const res = await fetch('/admin/api/logs', {
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                const logs = await res.json();
+                const container = document.getElementById('errorLogs');
+                
+                if (!logs.length) {
+                    container.innerHTML = '<p style="color: #888; text-align: center;">暂无错误日志</p>';
+                    return;
+                }
+                
+                container.innerHTML = logs.map(log => 
+                    '<div class="log-entry">' +
+                        '<div class="log-time">' + new Date(log.time).toLocaleString() + ' | 端口: ' + log.port + ' | IP: ' + log.clientIP + '</div>' +
+                        '<div class="log-error">' + log.error + '</div>' +
+                        '<div style="color: #888; font-size: 12px; margin-top: 5px;">URL: ' + log.url + '</div>' +
+                    '</div>'
+                ).join('');
+            } catch (e) {}
+        }
+        
+        async function clearLogs() {
+            if (!confirm('确定要清除所有错误日志吗？')) return;
+            try {
+                const res = await fetch('/admin/api/logs/clear', {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('errorLogs').innerHTML = '<p style="color: #888; text-align: center;">暂无错误日志</p>';
+                }
+            } catch (e) {}
+        }
+        
+        init();
+    </script>
 </body>
 </html>`;
 }
@@ -505,18 +1243,9 @@ async function handleStatsAPI(request, env) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const today = getStatsDateString();
+    const today = new Date().toISOString().split('T')[0];
+    const todayStats = hasKV ? (await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || { total: 0, success: 0, error: 0, bytes: 0, ports: {} }) : { total: 0, success: 0, error: 0, bytes: 0, ports: {} };
     const history = hasKV ? await getStatsSummary(env, 7) : [];
-    const todayEntry = history.find(item => item.date === today);
-    const todayStats = todayEntry ? {
-        total: todayEntry.total,
-        success: todayEntry.success,
-        error: todayEntry.error,
-        bytes: todayEntry.bytes,
-        duration: todayEntry.duration,
-        ports: todayEntry.ports,
-        peakQps: todayEntry.peakQps || 0
-    } : createEmptyStats();
     const backends = await getBackendConfig(env);
 
     return new Response(JSON.stringify({
@@ -717,8 +1446,12 @@ async function handleProxy(request, env) {
         const response = await fetch(modifiedRequest);
         const responseHeaders = new Headers(response.headers);
 
-        // 移除重定向处理，避免错误的重定向URL编码
-        // 如果后端返回绝对URL重定向，保持不变让浏览器直接访问
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+            const location = responseHeaders.get('Location');
+            if (location && (location.startsWith('http://') || location.startsWith('https://'))) {
+                responseHeaders.set('Location', `/${encodeURIComponent(location)}`);
+            }
+        }
 
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Cache-Control', 'no-store');
