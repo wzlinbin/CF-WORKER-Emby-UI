@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 /tmp/fix_workers.py)",
+      "Bash(python3 /tmp/patch.py)",
+      "Bash(python3 /tmp/fix_recordstats.py)",
+      "Bash(python3 /tmp/replace_func.py)",
+      "Bash(python3 /tmp/replace_logerror.py)",
+      "Bash(sed -i '/let lastErrorLogSave = 0;/d' workers.js)",
+      "Bash(sed -i '/const ERROR_LOG_SAVE_INTERVAL = 60000;/d' workers.js)",
+      "Bash(python3 /tmp/fix_statsapi.py)",
+      "Bash(python3 /tmp/fix_logsapi.py)",
+      "Bash(node --check workers.js)",
+      "Bash(python3 /tmp/add_cache.py)",
+      "Bash(python3 /tmp/fix_checkip.py)",
+      "Bash(python3 /tmp/fix_backend.py)",
+      "Bash(python3 /tmp/fix_accessapi.py)",
+      "Bash(python3 /tmp/fix_session.py)",
+      "Bash(python3 /tmp/fix_login.py)",
+      "Bash(python3 /tmp/cleanup.py)",
+      "Bash(python3 /tmp/update_readme.py)",
+      "Bash(sed -n '42,60p' workers.js)",
+      "Bash(sed -n '187,205p' workers.js)"
+    ]
+  }
+}
