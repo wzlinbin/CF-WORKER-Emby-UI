@@ -16,12 +16,12 @@ const ADMIN_PASSWORD = "yourpassword"; // 请修改为强密码！
 const DEFAULT_BACKENDS = {
     "8443": {
         name: "Emby 2",
-        url: "https://link00.okemby.org:8443",
+        url: "https://XXX.YYY.ZZZ:8443",
         enabled: true
     },
     "2053": {
         name: "Emby 3",
-        url: "https://www.lilyemby.com",
+        url: "https://XXX.YYY.ZZZ",
         enabled: true
     }
 };
