@@ -28,7 +28,10 @@
       "Bash(git add:*)",
       "Bash(git merge:*)",
       "Bash(git push:*)",
-      "Bash(git pull:*)"
+      "Bash(git pull:*)",
+      "Bash(git commit:*)",
+      "Bash(git rebase:*)",
+      "Bash(git branch:*)"
     ]
   }
 }
