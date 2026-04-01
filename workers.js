@@ -42,6 +42,18 @@ function generateToken() {
 // 内存中存储的token（用于无KV时的会话管理）
 let memoryToken = null;
 
+// 配置缓存（减少KV读取频率）
+const CONFIG_CACHE_TTL = 60000;
+let accessCache = {
+    blacklist: [],
+    whitelist: [],
+    loadedAt: 0
+};
+let backendCache = {
+    data: DEFAULT_BACKENDS,
+    loadedAt: 0
+};
+
 // 内存中的统计缓存（减少KV写入频率）
 let statsCache = {
     date: '',
@@ -86,30 +98,82 @@ function getClientIP(request) {
            'unknown';
 }
 
+async function getAccessConfig(env, forceRefresh = false) {
+    if (!env || !env.EMBY_KV) {
+        return { blacklist: [], whitelist: [] };
+    }
+
+    const now = Date.now();
+    if (!forceRefresh && accessCache.loadedAt && now - accessCache.loadedAt < CONFIG_CACHE_TTL) {
+        return {
+            blacklist: accessCache.blacklist,
+            whitelist: accessCache.whitelist
+        };
+    }
+
+    const blacklist = await env.EMBY_KV.get('config:blacklist', { type: 'json' }) || [];
+    const whitelist = await env.EMBY_KV.get('config:whitelist', { type: 'json' }) || [];
+
+    accessCache = {
+        blacklist,
+        whitelist,
+        loadedAt: now
+    };
+
+    return { blacklist, whitelist };
+}
+
+function updateAccessCache(type, list) {
+    if (type === 'blacklist') {
+        accessCache.blacklist = list;
+    } else {
+        accessCache.whitelist = list;
+    }
+    accessCache.loadedAt = Date.now();
+}
+
 // 检查IP是否在黑名单/白名单中
 async function checkIPAccess(clientIP, env) {
     if (!env || !env.EMBY_KV) return true;
-    const blacklist = await env.EMBY_KV.get('config:blacklist', { type: 'json' }) || [];
-    const whitelist = await env.EMBY_KV.get('config:whitelist', { type: 'json' });
-    
+
+    const { blacklist, whitelist } = await getAccessConfig(env);
+
     // 如果设置了白名单，只允许白名单IP
-    if (whitelist && whitelist.length > 0) {
+    if (whitelist.length > 0) {
         return whitelist.includes(clientIP);
     }
-    
+
     // 否则检查黑名单
     return !blacklist.includes(clientIP);
 }
 
 // 获取后端配置
-async function getBackendConfig(env) {
+async function getBackendConfig(env, forceRefresh = false) {
     if (!env || !env.EMBY_KV) return DEFAULT_BACKENDS;
+
+    const now = Date.now();
+    if (!forceRefresh && backendCache.loadedAt && now - backendCache.loadedAt < CONFIG_CACHE_TTL) {
+        return backendCache.data;
+    }
+
     const config = await env.EMBY_KV.get('config:backends', { type: 'json' });
-    return config || DEFAULT_BACKENDS;
+    backendCache = {
+        data: config || DEFAULT_BACKENDS,
+        loadedAt: now
+    };
+    return backendCache.data;
+}
+
+function updateBackendCache(config) {
+    backendCache = {
+        data: config,
+        loadedAt: Date.now()
+    };
 }
 
 // 保存后端配置
 async function saveBackendConfig(env, config) {
+    updateBackendCache(config);
     if (!env || !env.EMBY_KV) return;
     await env.EMBY_KV.put('config:backends', JSON.stringify(config));
 }
@@ -157,6 +221,7 @@ async function recordStats(env, port, success, bytes, duration) {
 }
 
 // 错误日志缓存
+const ERROR_LOGS_KEY = 'logs:errors';
 let errorLogCache = [];
 let lastErrorLogSave = 0;
 const ERROR_LOG_SAVE_INTERVAL = 60000; // 每60秒写入一次
@@ -164,9 +229,9 @@ const ERROR_LOG_SAVE_INTERVAL = 60000; // 每60秒写入一次
 // 记录错误日志（使用缓存，减少KV写入）
 async function logError(env, port, error, url, clientIP) {
     if (!env || !env.EMBY_KV) return;
-    
+
     const now = Date.now();
-    
+
     // 添加到缓存
     errorLogCache.push({
         time: new Date().toISOString(),
@@ -175,22 +240,17 @@ async function logError(env, port, error, url, clientIP) {
         url: url,
         clientIP: clientIP
     });
-    
+
     // 只保留最近50条错误
     if (errorLogCache.length > 50) {
         errorLogCache = errorLogCache.slice(-50);
     }
-    
-    // 每60秒写入一次KV
-    if (now - lastErrorLogSave >= ERROR_LOG_SAVE_INTERVAL) {
+
+    // 每60秒覆盖写入一次单个KV key
+    if (now - lastErrorLogSave >= ERROR_LOG_SAVE_INTERVAL || lastErrorLogSave === 0) {
         lastErrorLogSave = now;
         try {
-            // 只保存最新的错误
-            const recentErrors = errorLogCache.slice(-10);
-            for (let i = 0; i < recentErrors.length; i++) {
-                const key = `logs:errors:${now + i}`;
-                await env.EMBY_KV.put(key, JSON.stringify(recentErrors[i]), { expirationTtl: 86400 * 7 });
-            }
+            await env.EMBY_KV.put(ERROR_LOGS_KEY, JSON.stringify(errorLogCache), { expirationTtl: 86400 * 7 });
         } catch (e) {
             console.error('KV write error:', e.message);
         }
@@ -200,13 +260,8 @@ async function logError(env, port, error, url, clientIP) {
 // 获取最近错误日志
 async function getRecentErrors(env, limit = 50) {
     if (!env || !env.EMBY_KV) return [];
-    const list = await env.EMBY_KV.list({ prefix: 'logs:errors:', limit: limit });
-    const logs = [];
-    for (const key of list.keys) {
-        const log = await env.EMBY_KV.get(key.name, { type: 'json' });
-        if (log) logs.push(log);
-    }
-    return logs.sort((a, b) => new Date(b.time) - new Date(a.time));
+    const logs = await env.EMBY_KV.get(ERROR_LOGS_KEY, { type: 'json' }) || [];
+    return logs.slice(-limit).sort((a, b) => new Date(b.time) - new Date(a.time));
 }
 
 // 获取统计数据
@@ -1261,7 +1316,7 @@ async function handleBackendsAPI(request, env) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const backends = await getBackendConfig(env);
+    const backends = { ...(await getBackendConfig(env)) };
 
     if (request.method === 'GET') {
         return new Response(JSON.stringify(backends), { headers: { 'Content-Type': 'application/json' } });
@@ -1294,7 +1349,7 @@ async function handleToggleBackendAPI(request, env) {
     }
 
     const body = await request.json();
-    const backends = await getBackendConfig(env);
+    const backends = { ...(await getBackendConfig(env)) };
 
     if (backends[body.port]) {
         backends[body.port].enabled = !backends[body.port].enabled;
@@ -1324,15 +1379,15 @@ async function handleAccessAPI(request, env) {
     }
 
     if (request.method === 'GET') {
-        const blacklist = await env.EMBY_KV.get('config:blacklist', { type: 'json' }) || [];
-        const whitelist = await env.EMBY_KV.get('config:whitelist', { type: 'json' }) || [];
+        const { blacklist, whitelist } = await getAccessConfig(env);
         return new Response(JSON.stringify({ blacklist, whitelist }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     if (request.method === 'POST') {
         const body = await request.json();
         const key = body.type === 'blacklist' ? 'config:blacklist' : 'config:whitelist';
-        let list = await env.EMBY_KV.get(key, { type: 'json' }) || [];
+        const { blacklist, whitelist } = await getAccessConfig(env);
+        let list = body.type === 'blacklist' ? [...blacklist] : [...whitelist];
 
         if (body.action === 'add' && !list.includes(body.ip)) {
             list.push(body.ip);
@@ -1340,6 +1395,7 @@ async function handleAccessAPI(request, env) {
             list = list.filter(ip => ip !== body.ip);
         }
 
+        updateAccessCache(body.type, list);
         await env.EMBY_KV.put(key, JSON.stringify(list));
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
     }
@@ -1369,12 +1425,9 @@ async function handleClearLogsAPI(request, env) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const list = await env.EMBY_KV.list({ prefix: 'logs:errors:' });
-    for (const key of list.keys) {
-        await env.EMBY_KV.delete(key.name);
-    }
-
+    await env.EMBY_KV.delete(ERROR_LOGS_KEY);
     errorLogCache = [];
+    lastErrorLogSave = 0;
 
     return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 }
