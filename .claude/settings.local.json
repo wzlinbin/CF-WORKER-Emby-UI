@@ -20,7 +20,15 @@
       "Bash(python3 /tmp/cleanup.py)",
       "Bash(python3 /tmp/update_readme.py)",
       "Bash(sed -n '42,60p' workers.js)",
-      "Bash(sed -n '187,205p' workers.js)"
+      "Bash(sed -n '187,205p' workers.js)",
+      "Bash(git checkout:*)",
+      "Bash(git stash:*)",
+      "Bash(git restore:*)",
+      "Bash(rm -f .claude/settings.local.json)",
+      "Bash(git add:*)",
+      "Bash(git merge:*)",
+      "Bash(git push:*)",
+      "Bash(git pull:*)"
     ]
   }
 }
