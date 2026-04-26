@@ -1,0 +1,15 @@
+name = "emby-reverseproxy"
+main = "workers.js"
+compatibility_date = "2026-04-27"
+
+[[kv_namespaces]]
+binding = "EMBY_KV"
+id = "9fdcf76a9e9945bca94f408d933595a1"
+
+[[durable_objects.bindings]]
+name = "STATS_DO"
+class_name = "StatsDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StatsDurableObject"]
