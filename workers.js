@@ -178,46 +178,70 @@ async function saveBackendConfig(env, config) {
     await env.EMBY_KV.put('config:backends', JSON.stringify(config));
 }
 
-// 记录统计数据（使用内存缓存，减少KV写入）
-async function recordStats(env, port, success, bytes, duration) {
+function createEmptyStats() {
+    return { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
+}
+
+function applyStatsIncrement(stats, port, success, bytes, duration) {
+    stats.total++;
+    if (success) stats.success++;
+    else stats.error++;
+    stats.bytes += bytes;
+    stats.duration += duration;
+
+    if (!stats.ports[port]) {
+        stats.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
+    }
+    stats.ports[port].total++;
+    if (success) stats.ports[port].success++;
+    else stats.ports[port].error++;
+    stats.ports[port].bytes += bytes;
+}
+
+async function recordStatsFallback(env, port, success, bytes, duration) {
     if (!env || !env.EMBY_KV) return;
-    
+
     const today = new Date().toISOString().split('T')[0];
     const now = Date.now();
-    
-    // 如果是新的一天，重置缓存
+
     if (statsCache.date !== today) {
         statsCache.date = today;
-        statsCache.data = { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
+        statsCache.data = createEmptyStats();
         statsCache.lastSave = 0;
     }
-    
-    // 更新内存中的统计数据
-    statsCache.data.total++;
-    if (success) statsCache.data.success++;
-    else statsCache.data.error++;
-    statsCache.data.bytes += bytes;
-    statsCache.data.duration += duration;
-    
-    if (!statsCache.data.ports[port]) {
-        statsCache.data.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
-    }
-    statsCache.data.ports[port].total++;
-    if (success) statsCache.data.ports[port].success++;
-    else statsCache.data.ports[port].error++;
-    statsCache.data.ports[port].bytes += bytes;
-    
-    // 每30秒写入一次KV，或者首次请求时写入
+
+    applyStatsIncrement(statsCache.data, port, success, bytes, duration);
+
     if (now - statsCache.lastSave >= STATS_SAVE_INTERVAL || statsCache.lastSave === 0) {
         statsCache.lastSave = now;
         try {
             const key = `stats:${today}`;
             await env.EMBY_KV.put(key, JSON.stringify(statsCache.data), { expirationTtl: 86400 * 90 });
         } catch (e) {
-            // KV写入失败时忽略，不影响代理功能
             console.error('KV write error:', e.message);
         }
     }
+}
+
+async function recordStats(env, port, success, bytes, duration) {
+    if (!env) return;
+
+    if (env.STATS_DO) {
+        try {
+            const id = env.STATS_DO.idFromName('global-stats');
+            const stub = env.STATS_DO.get(id);
+            await stub.fetch('https://stats.local/increment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ port, success, bytes, duration })
+            });
+            return;
+        } catch (e) {
+            console.error('Durable Object stats error:', e.message);
+        }
+    }
+
+    await recordStatsFallback(env, port, success, bytes, duration);
 }
 
 // 错误日志缓存
@@ -1270,6 +1294,133 @@ function getAdminHTML() {
 </html>`;
 }
 
+// ==================== Durable Object 统计聚合 ====================
+
+export class StatsDurableObject {
+    constructor(ctx, env) {
+        this.ctx = ctx;
+        this.env = env;
+        this.lastKvSave = 0;
+        this.ctx.storage.sql.exec(`
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                date TEXT PRIMARY KEY,
+                total INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                error INTEGER NOT NULL,
+                bytes INTEGER NOT NULL,
+                duration INTEGER NOT NULL,
+                ports TEXT NOT NULL
+            )
+        `);
+    }
+
+    async fetch(request) {
+        const url = new URL(request.url);
+
+        if (url.pathname === '/summary' && request.method === 'GET') {
+            const days = Math.max(1, Math.min(30, Number(url.searchParams.get('days')) || 7));
+            const history = this.getHistory(days);
+            const today = new Date().toISOString().split('T')[0];
+            return new Response(JSON.stringify({
+                today: this.getStats(today),
+                history
+            }), {
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        if (url.pathname !== '/increment' || request.method !== 'POST') {
+            return new Response('Not found', { status: 404 });
+        }
+
+        const body = await request.json();
+        const today = new Date().toISOString().split('T')[0];
+        const stats = this.getStats(today);
+
+        applyStatsIncrement(
+            stats,
+            String(body.port || 'default'),
+            body.success === true,
+            Number(body.bytes) || 0,
+            Number(body.duration) || 0
+        );
+
+        this.saveStats(today, stats);
+        this.syncKvIfNeeded(today, stats);
+
+        return new Response(JSON.stringify({ success: true }), {
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+
+    getStats(date) {
+        const row = this.ctx.storage.sql
+            .exec('SELECT total, success, error, bytes, duration, ports FROM daily_stats WHERE date = ?', date)
+            .one();
+
+        if (!row) return createEmptyStats();
+
+        return {
+            total: row.total,
+            success: row.success,
+            error: row.error,
+            bytes: row.bytes,
+            duration: row.duration,
+            ports: JSON.parse(row.ports || '{}')
+        };
+    }
+
+    getHistory(days) {
+        const today = new Date();
+        const history = [];
+
+        for (let i = 0; i < days; i++) {
+            const date = new Date(today);
+            date.setDate(date.getDate() - i);
+            const dateStr = date.toISOString().split('T')[0];
+            const stats = this.getStats(dateStr);
+            if (stats.total > 0) {
+                history.push({ date: dateStr, ...stats });
+            }
+        }
+
+        return history;
+    }
+
+    saveStats(date, stats) {
+        this.ctx.storage.sql.exec(
+            `INSERT INTO daily_stats (date, total, success, error, bytes, duration, ports)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(date) DO UPDATE SET
+                total = excluded.total,
+                success = excluded.success,
+                error = excluded.error,
+                bytes = excluded.bytes,
+                duration = excluded.duration,
+                ports = excluded.ports`,
+            date,
+            stats.total,
+            stats.success,
+            stats.error,
+            stats.bytes,
+            stats.duration,
+            JSON.stringify(stats.ports)
+        );
+    }
+
+    syncKvIfNeeded(date, stats) {
+        if (!this.env.EMBY_KV) return;
+        const now = Date.now();
+        if (now - this.lastKvSave < STATS_SAVE_INTERVAL && this.lastKvSave !== 0) return;
+
+        this.lastKvSave = now;
+        this.ctx.waitUntil(
+            this.env.EMBY_KV.put(`stats:${date}`, JSON.stringify(stats), { expirationTtl: 86400 * 90 })
+                .catch(e => console.error('KV write error:', e.message))
+        );
+    }
+}
+
 // ==================== API 处理函数 ====================
 
 async function handleLogin(request, env) {
@@ -1298,9 +1449,30 @@ async function handleStatsAPI(request, env) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const today = new Date().toISOString().split('T')[0];
-    const todayStats = hasKV ? (await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || { total: 0, success: 0, error: 0, bytes: 0, ports: {} }) : { total: 0, success: 0, error: 0, bytes: 0, ports: {} };
-    const history = hasKV ? await getStatsSummary(env, 7) : [];
+    let todayStats = createEmptyStats();
+    let history = [];
+    let loadedFromDurableObject = false;
+
+    if (env && env.STATS_DO) {
+        try {
+            const id = env.STATS_DO.idFromName('global-stats');
+            const stub = env.STATS_DO.get(id);
+            const res = await stub.fetch('https://stats.local/summary?days=7');
+            const data = await res.json();
+            todayStats = data.today || todayStats;
+            history = data.history || [];
+            loadedFromDurableObject = true;
+        } catch (e) {
+            console.error('Durable Object stats read error:', e.message);
+        }
+    }
+
+    if (!loadedFromDurableObject) {
+        const today = new Date().toISOString().split('T')[0];
+        todayStats = hasKV ? (await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || createEmptyStats()) : createEmptyStats();
+        history = hasKV ? await getStatsSummary(env, 7) : [];
+    }
+
     const backends = await getBackendConfig(env);
 
     return new Response(JSON.stringify({
@@ -1434,7 +1606,7 @@ async function handleClearLogsAPI(request, env) {
 
 // ==================== 代理处理函数 ====================
 
-async function handleProxy(request, env) {
+async function handleProxy(request, env, ctx) {
     const url = new URL(request.url);
     const clientIP = getClientIP(request);
 
@@ -1509,11 +1681,48 @@ async function handleProxy(request, env) {
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Cache-Control', 'no-store');
 
-        const contentLength = parseInt(responseHeaders.get('Content-Length') || '0');
-        const duration = Date.now() - startTime;
-        await recordStats(env, portKey, true, contentLength, duration);
+        if (!response.body) {
+            const duration = Date.now() - startTime;
+            await recordStats(env, portKey, response.ok, 0, duration);
 
-        return new Response(response.body, {
+            return new Response(null, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: responseHeaders
+            });
+        }
+
+        const reader = response.body.getReader();
+        let responseBytes = 0;
+        let statsRecorded = false;
+        const recordFinalStats = () => {
+            if (statsRecorded) return;
+            statsRecorded = true;
+            const duration = Date.now() - startTime;
+            const statsPromise = recordStats(env, portKey, response.ok, responseBytes, duration);
+            if (ctx && typeof ctx.waitUntil === 'function') {
+                ctx.waitUntil(statsPromise);
+            }
+        };
+
+        const countedBody = new ReadableStream({
+            async pull(controller) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    recordFinalStats();
+                    controller.close();
+                    return;
+                }
+                responseBytes += value.byteLength || 0;
+                controller.enqueue(value);
+            },
+            async cancel(reason) {
+                recordFinalStats();
+                await reader.cancel(reason);
+            }
+        });
+
+        return new Response(countedBody, {
             status: response.status,
             statusText: response.statusText,
             headers: responseHeaders
@@ -1530,7 +1739,7 @@ async function handleProxy(request, env) {
 
 // ==================== 主入口 ====================
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
@@ -1567,12 +1776,12 @@ async function handleRequest(request, env) {
         }
     }
 
-    return handleProxy(request, env);
+    return handleProxy(request, env, ctx);
 }
 
 // 事件监听器 - ES Modules 格式
 export default {
     async fetch(request, env, ctx) {
-        return handleRequest(request, env);
+        return handleRequest(request, env, ctx);
     }
 };
