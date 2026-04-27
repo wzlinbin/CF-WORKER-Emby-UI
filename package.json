@@ -1,0 +1,8 @@
+{
+  "name": "emby-reverseproxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

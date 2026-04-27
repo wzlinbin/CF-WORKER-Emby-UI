@@ -5,7 +5,7 @@
 
 // ==================== 配置区 ====================
 // 管理员密码（建议通过环境变量设置：wrangler.toml 或 Cloudflare Dashboard）
-const ADMIN_PASSWORD = "admin123"; // 请修改为强密码！
+const ADMIN_PASSWORD = "qq983303"; // 请修改为强密码！
 
 // KV 命名空间绑定（需要在 wrangler.toml 中配置）
 // [[kv_namespaces]]
@@ -15,18 +15,13 @@ const ADMIN_PASSWORD = "admin123"; // 请修改为强密码！
 // ==================== 默认后端配置 ====================
 const DEFAULT_BACKENDS = {
     "8443": {
-        name: "Emby 2",
-        url: "https://XXX.YYY.ZZZ:8443",
+        name: "okemby",
+        url: "https://link00.okemby.org:8443",
         enabled: true
     },
-    "2053": {
-        name: "Emby 3",
-        url: "https://XXX.YYY.ZZZ",
-        enabled: true
-    },
-    "default": {
-        name: "Emby 1 (默认)",
-        url: "http://XXX.YYY.ZZZ:8880",
+    "443": {
+        name: "Lilyemby",
+        url: "https://free.lilyemby.com:443",
         enabled: true
     }
 };
@@ -63,6 +58,20 @@ let statsCache = {
 
 // 统计写入间隔（毫秒）- 每30秒写入一次KV
 const STATS_SAVE_INTERVAL = 30000;
+const STATS_STREAM_FLUSH_BYTES = 8 * 1024 * 1024;
+const STATS_STREAM_FLUSH_INTERVAL = 10000;
+const STATS_OPEN_RANGE_COUNT_LIMIT = 16 * 1024 * 1024;
+const PROXY_DEBUG_LOGS = true;
+
+function getStatsDoStub(env) {
+    if (!env || !env.STATS_DO) return null;
+    return env.STATS_DO.get(env.STATS_DO.idFromName('global-stats'));
+}
+
+function proxyDebug(event, data = {}) {
+    if (!PROXY_DEBUG_LOGS) return;
+    console.log('[proxy-debug]', JSON.stringify({ event, ...data }));
+}
 
 // 验证管理员会话
 async function verifySession(request, env) {
@@ -179,26 +188,249 @@ async function saveBackendConfig(env, config) {
 }
 
 function createEmptyStats() {
-    return { total: 0, success: 0, error: 0, bytes: 0, duration: 0, ports: {} };
+    return {
+        total: 0,
+        success: 0,
+        error: 0,
+        bytes: 0,
+        duration: 0,
+        ports: {},
+        statusCodes: {},
+        rangeRequests: 0,
+        partialContentResponses: 0,
+        mediaRequests: 0,
+        mediaBytes: 0,
+        apiBytes: 0,
+        maxRequestBytes: 0,
+        unmeteredMediaRequests: 0,
+        unmeteredMediaBytesHint: 0
+    };
 }
 
-function applyStatsIncrement(stats, port, success, bytes, duration) {
-    stats.total++;
-    if (success) stats.success++;
-    else stats.error++;
-    stats.bytes += bytes;
-    stats.duration += duration;
-
-    if (!stats.ports[port]) {
-        stats.ports[port] = { total: 0, success: 0, error: 0, bytes: 0 };
+function ensureStatsShape(stats) {
+    const empty = createEmptyStats();
+    for (const key in empty) {
+        if (stats[key] === undefined) stats[key] = empty[key];
     }
-    stats.ports[port].total++;
-    if (success) stats.ports[port].success++;
-    else stats.ports[port].error++;
-    stats.ports[port].bytes += bytes;
+    if (!stats.ports) stats.ports = {};
+    if (!stats.statusCodes) stats.statusCodes = {};
+    return stats;
 }
 
-async function recordStatsFallback(env, port, success, bytes, duration) {
+function createEmptyPortStats() {
+    return {
+        total: 0,
+        success: 0,
+        error: 0,
+        bytes: 0,
+        duration: 0,
+        statusCodes: {},
+        rangeRequests: 0,
+        partialContentResponses: 0,
+        mediaRequests: 0,
+        mediaBytes: 0,
+        apiBytes: 0,
+        maxRequestBytes: 0,
+        unmeteredMediaRequests: 0,
+        unmeteredMediaBytesHint: 0
+    };
+}
+
+const EMPTY_PORT_STATS = createEmptyPortStats();
+
+function ensurePortStatsShape(portStats) {
+    for (const key in EMPTY_PORT_STATS) {
+        if (portStats[key] === undefined) {
+            portStats[key] = typeof EMPTY_PORT_STATS[key] === 'object' ? { ...EMPTY_PORT_STATS[key] } : EMPTY_PORT_STATS[key];
+        }
+    }
+    if (!portStats.statusCodes) portStats.statusCodes = {};
+    return portStats;
+}
+
+function parseJsonObject(value, fallback = {}) {
+    if (!value) return fallback;
+    if (typeof value === 'object') return value;
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : fallback;
+    } catch (e) {
+        return fallback;
+    }
+}
+
+function addStatusCodes(target, source) {
+    for (const [code, count] of Object.entries(source || {})) {
+        target[code] = (target[code] || 0) + (Number(count) || 0);
+    }
+}
+
+function aggregateExtendedStatsFromPorts(stats) {
+    ensureStatsShape(stats);
+    const aggregate = {
+        statusCodes: {},
+        rangeRequests: 0,
+        partialContentResponses: 0,
+        mediaRequests: 0,
+        mediaBytes: 0,
+        apiBytes: 0,
+        maxRequestBytes: 0,
+        unmeteredMediaRequests: 0,
+        unmeteredMediaBytesHint: 0
+    };
+
+    for (const portStats of Object.values(stats.ports || {})) {
+        ensurePortStatsShape(portStats);
+        addStatusCodes(aggregate.statusCodes, portStats.statusCodes);
+        aggregate.rangeRequests += Number(portStats.rangeRequests) || 0;
+        aggregate.partialContentResponses += Number(portStats.partialContentResponses) || 0;
+        aggregate.mediaRequests += Number(portStats.mediaRequests) || 0;
+        aggregate.mediaBytes += Number(portStats.mediaBytes) || 0;
+        aggregate.apiBytes += Number(portStats.apiBytes) || 0;
+        aggregate.maxRequestBytes = Math.max(aggregate.maxRequestBytes, Number(portStats.maxRequestBytes) || 0);
+        aggregate.unmeteredMediaRequests += Number(portStats.unmeteredMediaRequests) || 0;
+        aggregate.unmeteredMediaBytesHint += Number(portStats.unmeteredMediaBytesHint) || 0;
+    }
+
+    stats.statusCodes = aggregate.statusCodes;
+    stats.rangeRequests = aggregate.rangeRequests;
+    stats.partialContentResponses = aggregate.partialContentResponses;
+    stats.mediaRequests = aggregate.mediaRequests;
+    stats.mediaBytes = aggregate.mediaBytes;
+    stats.apiBytes = aggregate.apiBytes;
+    stats.maxRequestBytes = aggregate.maxRequestBytes;
+    stats.unmeteredMediaRequests = aggregate.unmeteredMediaRequests;
+    stats.unmeteredMediaBytesHint = aggregate.unmeteredMediaBytesHint;
+    return stats;
+}
+
+function statsFromStorageRow(row) {
+    if (!row) return createEmptyStats();
+
+    const details = parseJsonObject(row.details, null);
+    const stats = ensureStatsShape(details ? { ...details } : {});
+    stats.total = Number(row.total) || 0;
+    stats.success = Number(row.success) || 0;
+    stats.error = Number(row.error) || 0;
+    stats.bytes = Number(row.bytes) || 0;
+    stats.duration = Number(row.duration) || 0;
+    stats.ports = parseJsonObject(row.ports, stats.ports || {});
+
+    if (!details) {
+        aggregateExtendedStatsFromPorts(stats);
+    }
+
+    return ensureStatsShape(stats);
+}
+
+function applyStatsIncrement(stats, port, success, bytes, duration, countRequest = true, meta = {}) {
+    ensureStatsShape(stats);
+    if (countRequest) {
+        stats.total++;
+        if (success) stats.success++;
+        else stats.error++;
+        stats.duration += duration;
+        if (meta.statusCode) {
+            const code = String(meta.statusCode);
+            stats.statusCodes[code] = (stats.statusCodes[code] || 0) + 1;
+        }
+        if (meta.hasRange) stats.rangeRequests++;
+        if (meta.isPartialContent) stats.partialContentResponses++;
+        if (meta.isMedia) stats.mediaRequests++;
+        if (meta.isUnmeteredPassthrough) stats.unmeteredMediaRequests++;
+    }
+    stats.bytes += bytes;
+    if (meta.isMedia) stats.mediaBytes += bytes;
+    else stats.apiBytes += bytes;
+    if (bytes > stats.maxRequestBytes) stats.maxRequestBytes = bytes;
+    if (meta.isUnmeteredPassthrough) stats.unmeteredMediaBytesHint += Number(meta.unmeteredBytesHint) || 0;
+
+    if (!stats.ports[port]) stats.ports[port] = createEmptyPortStats();
+    const portStats = ensurePortStatsShape(stats.ports[port]);
+    if (countRequest) {
+        portStats.total++;
+        if (success) portStats.success++;
+        else portStats.error++;
+        portStats.duration += duration;
+        if (meta.statusCode) {
+            const code = String(meta.statusCode);
+            portStats.statusCodes[code] = (portStats.statusCodes[code] || 0) + 1;
+        }
+        if (meta.hasRange) portStats.rangeRequests++;
+        if (meta.isPartialContent) portStats.partialContentResponses++;
+        if (meta.isMedia) portStats.mediaRequests++;
+        if (meta.isUnmeteredPassthrough) portStats.unmeteredMediaRequests++;
+    }
+    portStats.bytes += bytes;
+    if (meta.isMedia) portStats.mediaBytes += bytes;
+    else portStats.apiBytes += bytes;
+    if (bytes > portStats.maxRequestBytes) portStats.maxRequestBytes = bytes;
+    if (meta.isUnmeteredPassthrough) portStats.unmeteredMediaBytesHint += Number(meta.unmeteredBytesHint) || 0;
+}
+
+function isMediaResponse(path, contentType) {
+    const lowerPath = path.toLowerCase();
+    const lowerType = (contentType || '').toLowerCase();
+    return lowerType.startsWith('video/') ||
+        lowerType.startsWith('audio/') ||
+        lowerPath.includes('/videos/') ||
+        lowerPath.includes('/audio/') ||
+        lowerPath.includes('/stream') ||
+        lowerPath.includes('/download');
+}
+
+function parseContentLength(headers) {
+    const value = Number(headers.get('Content-Length') || 0);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function parseContentRangeBytes(contentRange) {
+    const match = String(contentRange || '').match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+    if (!match) return 0;
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return 0;
+    return end - start + 1;
+}
+
+function isBoundedSingleRange(rangeHeader) {
+    const match = String(rangeHeader || '').match(/^bytes=(\d+)-(\d+)$/i);
+    if (!match) return false;
+    return Number(match[2]) >= Number(match[1]);
+}
+
+function isOpenEndedRange(rangeHeader) {
+    return /^bytes=\d+-$/i.test(String(rangeHeader || ''));
+}
+
+function getPassthroughStatsBytes(rangeHeader, responseHeaders) {
+    if (isBoundedSingleRange(rangeHeader)) {
+        return parseContentRangeBytes(responseHeaders.get('Content-Range')) || parseContentLength(responseHeaders);
+    }
+
+    if (isOpenEndedRange(rangeHeader)) {
+        const rangeBytes = parseContentRangeBytes(responseHeaders.get('Content-Range')) || parseContentLength(responseHeaders);
+        return rangeBytes > 0 && rangeBytes <= STATS_OPEN_RANGE_COUNT_LIMIT ? rangeBytes : 0;
+    }
+
+    return 0;
+}
+
+function getPassthroughByteSource(rangeHeader, bytes) {
+    if (bytes <= 0) return 'unmetered-passthrough';
+    return isBoundedSingleRange(rangeHeader) ? 'bounded-range' : 'small-open-range';
+}
+
+function sanitizeLogUrl(urlValue) {
+    try {
+        const parsed = new URL(urlValue, 'https://proxy.local');
+        return parsed.pathname + (parsed.search ? '?[已隐藏]' : '');
+    } catch (e) {
+        return String(urlValue || '').split('?')[0];
+    }
+}
+
+async function recordStatsFallback(env, port, success, bytes, duration, countRequest = true, meta = {}) {
     if (!env || !env.EMBY_KV) return;
 
     const today = new Date().toISOString().split('T')[0];
@@ -210,7 +442,7 @@ async function recordStatsFallback(env, port, success, bytes, duration) {
         statsCache.lastSave = 0;
     }
 
-    applyStatsIncrement(statsCache.data, port, success, bytes, duration);
+    applyStatsIncrement(statsCache.data, port, success, bytes, duration, countRequest, meta);
 
     if (now - statsCache.lastSave >= STATS_SAVE_INTERVAL || statsCache.lastSave === 0) {
         statsCache.lastSave = now;
@@ -223,17 +455,16 @@ async function recordStatsFallback(env, port, success, bytes, duration) {
     }
 }
 
-async function recordStats(env, port, success, bytes, duration) {
+async function recordStats(env, port, success, bytes, duration, countRequest = true, meta = {}) {
     if (!env) return;
 
-    if (env.STATS_DO) {
+    const stub = getStatsDoStub(env);
+    if (stub) {
         try {
-            const id = env.STATS_DO.idFromName('global-stats');
-            const stub = env.STATS_DO.get(id);
             await stub.fetch('https://stats.local/increment', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ port, success, bytes, duration })
+                body: JSON.stringify({ port, success, bytes, duration, countRequest, meta })
             });
             return;
         } catch (e) {
@@ -241,7 +472,7 @@ async function recordStats(env, port, success, bytes, duration) {
         }
     }
 
-    await recordStatsFallback(env, port, success, bytes, duration);
+    await recordStatsFallback(env, port, success, bytes, duration, countRequest, meta);
 }
 
 // 错误日志缓存
@@ -291,20 +522,20 @@ async function getRecentErrors(env, limit = 50) {
 // 获取统计数据
 async function getStatsSummary(env, days = 7) {
     if (!env || !env.EMBY_KV) return [];
-    const stats = [];
     const today = new Date();
-    
+    const reads = [];
+
     for (let i = 0; i < days; i++) {
         const date = new Date(today);
         date.setDate(date.getDate() - i);
         const dateStr = date.toISOString().split('T')[0];
-        const dayStats = await env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' });
-        if (dayStats) {
-            stats.push({ date: dateStr, ...dayStats });
-        }
+        reads.push(
+            env.EMBY_KV.get(`stats:${dateStr}`, { type: 'json' })
+                .then(dayStats => dayStats ? { date: dateStr, ...dayStats } : null)
+        );
     }
-    
-    return stats;
+
+    return (await Promise.all(reads)).filter(Boolean);
 }
 
 // ==================== 管理面板 HTML ====================
@@ -533,8 +764,20 @@ function getAdminHTML() {
                             <span class="analysis-value" id="dailyBytesAvg">-</span>
                         </div>
                         <div class="analysis-item">
+                            <span class="analysis-label">媒体流量</span>
+                            <span class="analysis-value" id="mediaBytes">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">接口流量</span>
+                            <span class="analysis-value" id="apiBytes">-</span>
+                        </div>
+                        <div class="analysis-item">
                             <span class="analysis-label">平均请求大小</span>
                             <span class="analysis-value" id="avgRequestSize">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">最大单次流量</span>
+                            <span class="analysis-value" id="maxRequestBytes">-</span>
                         </div>
                         <div class="analysis-item">
                             <span class="analysis-label">峰值流量日</span>
@@ -548,12 +791,24 @@ function getAdminHTML() {
                             <span class="analysis-value" id="avgResponseTime">-</span>
                         </div>
                         <div class="analysis-item">
+                            <span class="analysis-label">分段请求数</span>
+                            <span class="analysis-value" id="rangeRequests">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">分段响应数</span>
+                            <span class="analysis-value" id="partialResponses">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">媒体请求数</span>
+                            <span class="analysis-value" id="mediaRequests">-</span>
+                        </div>
+                        <div class="analysis-item">
                             <span class="analysis-label">健康状态</span>
                             <span class="analysis-value" id="healthStatus">-</span>
                         </div>
                     </div>
                     <div class="analysis-card">
-                        <h4>错误分析</h4>
+                        <h4>状态分析</h4>
                         <div class="analysis-item">
                             <span class="analysis-label">7天总错误</span>
                             <span class="analysis-value" id="weekErrors">-</span>
@@ -561,6 +816,14 @@ function getAdminHTML() {
                         <div class="analysis-item">
                             <span class="analysis-label">错误率</span>
                             <span class="analysis-value" id="errorRate">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">状态码分布</span>
+                            <span class="analysis-value" id="statusCodeSummary">-</span>
+                        </div>
+                        <div class="analysis-item">
+                            <span class="analysis-label">统计来源</span>
+                            <span class="analysis-value" id="statsSource">-</span>
                         </div>
                         <div class="analysis-item">
                             <span class="analysis-label">错误趋势</span>
@@ -580,6 +843,8 @@ function getAdminHTML() {
                             <th>今日请求</th>
                             <th>成功率</th>
                             <th>今日流量</th>
+                            <th>媒体流量</th>
+                            <th>分段响应</th>
                             <th>平均响应</th>
                             <th>状态</th>
                         </tr>
@@ -872,7 +1137,7 @@ function getAdminHTML() {
                 
                 renderLineChart(data.history || []);
                 renderPieChart(data.today, data.backends);
-                renderAnalysis(data.history || [], data.today);
+                renderAnalysis(data.history || [], data.today, data.statsSource);
                 renderPortStats(data.today, data.backends);
                 renderBackendList(data.backends);
             } catch (e) {
@@ -964,7 +1229,20 @@ function getAdminHTML() {
             container.innerHTML = '<svg viewBox="0 0 100 100">' + paths + '</svg><div class="pie-legend">' + legend + '</div>';
         }
         
-        function renderAnalysis(history, today) {
+        function getStatusCodeSummary(statusCodes) {
+            const entries = Object.entries(statusCodes || {}).sort((a, b) => Number(a[0]) - Number(b[0]));
+            return entries.length ? entries.map(([code, count]) => code + '：' + count).join('，') : '-';
+        }
+
+        function getStatsSourceLabel(source) {
+            if (source === 'durable_object') return '实时聚合';
+            if (source === 'kv') return '缓存统计';
+            if (source === 'durable_object_error') return '统计异常';
+            return '-';
+        }
+
+        function renderAnalysis(history, today, statsSource) {
+            today = today || {};
             if (!history.length) {
                 document.getElementById('weekTotal').textContent = '-';
                 document.getElementById('dailyAvg').textContent = '-';
@@ -973,6 +1251,14 @@ function getAdminHTML() {
                 document.getElementById('weekBytes').textContent = '-';
                 document.getElementById('dailyBytesAvg').textContent = '-';
                 document.getElementById('avgRequestSize').textContent = '-';
+                document.getElementById('mediaBytes').textContent = formatBytes(today.mediaBytes || 0);
+                document.getElementById('apiBytes').textContent = formatBytes(today.apiBytes || 0);
+                document.getElementById('maxRequestBytes').textContent = formatBytes(today.maxRequestBytes || 0);
+                document.getElementById('rangeRequests').textContent = (today.rangeRequests || 0).toLocaleString();
+                document.getElementById('partialResponses').textContent = (today.partialContentResponses || 0).toLocaleString();
+                document.getElementById('mediaRequests').textContent = (today.mediaRequests || 0).toLocaleString();
+                document.getElementById('statusCodeSummary').textContent = getStatusCodeSummary(today.statusCodes);
+                document.getElementById('statsSource').textContent = getStatsSourceLabel(statsSource);
                 document.getElementById('peakDay').textContent = '-';
                 return;
             }
@@ -982,6 +1268,12 @@ function getAdminHTML() {
             const weekErrors = history.reduce((sum, h) => sum + h.error, 0);
             const weekBytes = history.reduce((sum, h) => sum + h.bytes, 0);
             const weekDuration = history.reduce((sum, h) => sum + (h.duration || 0), 0);
+            const weekMediaBytes = history.reduce((sum, h) => sum + (h.mediaBytes || 0), 0);
+            const weekApiBytes = history.reduce((sum, h) => sum + (h.apiBytes || 0), 0);
+            const weekRangeRequests = history.reduce((sum, h) => sum + (h.rangeRequests || 0), 0);
+            const weekPartialResponses = history.reduce((sum, h) => sum + (h.partialContentResponses || 0), 0);
+            const weekMediaRequests = history.reduce((sum, h) => sum + (h.mediaRequests || 0), 0);
+            const maxRequestBytes = history.reduce((max, h) => Math.max(max, h.maxRequestBytes || 0), 0);
             
             document.getElementById('weekTotal').textContent = weekTotal.toLocaleString();
             document.getElementById('dailyAvg').textContent = Math.round(weekTotal / history.length).toLocaleString();
@@ -998,12 +1290,18 @@ function getAdminHTML() {
             
             document.getElementById('weekBytes').textContent = formatBytes(weekBytes);
             document.getElementById('dailyBytesAvg').textContent = formatBytes(weekBytes / history.length);
+            document.getElementById('mediaBytes').textContent = formatBytes(weekMediaBytes);
+            document.getElementById('apiBytes').textContent = formatBytes(weekApiBytes);
             document.getElementById('avgRequestSize').textContent = weekTotal > 0 ? formatBytes(weekBytes / weekTotal) : '-';
+            document.getElementById('maxRequestBytes').textContent = formatBytes(maxRequestBytes);
             
             const peakDay = history.reduce((max, h) => h.bytes > max.bytes ? h : max, history[0]);
             document.getElementById('peakDay').textContent = peakDay.date;
             
             document.getElementById('avgResponseTime').textContent = weekTotal > 0 ? (weekDuration / weekTotal).toFixed(0) + 'ms' : '-';
+            document.getElementById('rangeRequests').textContent = weekRangeRequests.toLocaleString();
+            document.getElementById('partialResponses').textContent = weekPartialResponses.toLocaleString();
+            document.getElementById('mediaRequests').textContent = weekMediaRequests.toLocaleString();
             
             const errorRate = weekTotal > 0 ? (weekErrors / weekTotal * 100) : 0;
             let health = '优秀', healthColor = '#4ecca3';
@@ -1014,6 +1312,8 @@ function getAdminHTML() {
             
             document.getElementById('weekErrors').textContent = weekErrors.toLocaleString();
             document.getElementById('errorRate').textContent = errorRate.toFixed(2) + '%';
+            document.getElementById('statusCodeSummary').textContent = getStatusCodeSummary(today.statusCodes);
+            document.getElementById('statsSource').textContent = getStatsSourceLabel(statsSource);
             
             if (history.length >= 2) {
                 const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
@@ -1029,20 +1329,22 @@ function getAdminHTML() {
             const tbody = document.getElementById('portStats');
             const ports = Object.keys(backends || {});
             if (!today || !today.ports) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #888;">暂无数据</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: #888;">暂无数据</td></tr>';
                 return;
             }
             tbody.innerHTML = ports.map(port => {
                 const backend = backends[port];
-                const stats = today.ports[port] || { total: 0, success: 0, error: 0, bytes: 0 };
+                const stats = today.ports[port] || { total: 0, success: 0, error: 0, bytes: 0, duration: 0, mediaBytes: 0, partialContentResponses: 0 };
                 const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0;
-                const avgDuration = stats.total > 0 ? Math.round((today.duration || 0) / today.total) : 0;
+                const avgDuration = stats.total > 0 ? Math.round((stats.duration || 0) / stats.total) : 0;
                 return '<tr>' +
                     '<td>' + port + '</td>' +
                     '<td>' + (backend.name || '-') + '</td>' +
                     '<td>' + stats.total.toLocaleString() + '</td>' +
                     '<td>' + rate + '%<div class="progress-bar"><div class="progress-fill" style="width:' + rate + '%"></div></div></td>' +
                     '<td>' + formatBytes(stats.bytes) + '</td>' +
+                    '<td>' + formatBytes(stats.mediaBytes || 0) + '</td>' +
+                    '<td>' + (stats.partialContentResponses || 0).toLocaleString() + '</td>' +
                     '<td>' + avgDuration + 'ms</td>' +
                     '<td><span class="status ' + (backend.enabled ? 'online' : 'offline') + '">' + (backend.enabled ? '启用' : '禁用') + '</span></td>' +
                     '</tr>';
@@ -1309,9 +1611,25 @@ export class StatsDurableObject {
                 error INTEGER NOT NULL,
                 bytes INTEGER NOT NULL,
                 duration INTEGER NOT NULL,
-                ports TEXT NOT NULL
+                ports TEXT NOT NULL,
+                details TEXT
             )
         `);
+        this.ensureSchema();
+    }
+
+    ensureSchema() {
+        try {
+            const columns = this.ctx.storage.sql.exec('PRAGMA table_info(daily_stats)').toArray();
+            const hasDetails = columns.some(column => column.name === 'details');
+            if (!hasDetails) {
+                this.ctx.storage.sql.exec('ALTER TABLE daily_stats ADD COLUMN details TEXT');
+            }
+        } catch (e) {
+            if (!String(e.message || '').toLowerCase().includes('duplicate')) {
+                console.error('Stats schema migration error:', e.message);
+            }
+        }
     }
 
     async fetch(request) {
@@ -1321,8 +1639,9 @@ export class StatsDurableObject {
             const days = Math.max(1, Math.min(30, Number(url.searchParams.get('days')) || 7));
             const history = this.getHistory(days);
             const today = new Date().toISOString().split('T')[0];
+            const todayStats = history.find(item => item.date === today);
             return new Response(JSON.stringify({
-                today: this.getStats(today),
+                today: todayStats ? ensureStatsShape({ ...todayStats }) : createEmptyStats(),
                 history
             }), {
                 headers: { 'Content-Type': 'application/json' }
@@ -1342,7 +1661,9 @@ export class StatsDurableObject {
             String(body.port || 'default'),
             body.success === true,
             Number(body.bytes) || 0,
-            Number(body.duration) || 0
+            Number(body.duration) || 0,
+            body.countRequest !== false,
+            body.meta || {}
         );
 
         this.saveStats(today, stats);
@@ -1355,56 +1676,58 @@ export class StatsDurableObject {
 
     getStats(date) {
         const row = this.ctx.storage.sql
-            .exec('SELECT total, success, error, bytes, duration, ports FROM daily_stats WHERE date = ?', date)
-            .one();
+            .exec('SELECT total, success, error, bytes, duration, ports, details FROM daily_stats WHERE date = ?', date)
+            .toArray()[0];
 
-        if (!row) return createEmptyStats();
-
-        return {
-            total: row.total,
-            success: row.success,
-            error: row.error,
-            bytes: row.bytes,
-            duration: row.duration,
-            ports: JSON.parse(row.ports || '{}')
-        };
+        return statsFromStorageRow(row);
     }
 
     getHistory(days) {
         const today = new Date();
-        const history = [];
+        const from = new Date(today);
+        from.setDate(from.getDate() - days + 1);
+        const fromStr = from.toISOString().split('T')[0];
+        const todayStr = today.toISOString().split('T')[0];
 
-        for (let i = 0; i < days; i++) {
-            const date = new Date(today);
-            date.setDate(date.getDate() - i);
-            const dateStr = date.toISOString().split('T')[0];
-            const stats = this.getStats(dateStr);
-            if (stats.total > 0) {
-                history.push({ date: dateStr, ...stats });
-            }
-        }
-
-        return history;
+        return this.ctx.storage.sql
+            .exec(
+                `SELECT date, total, success, error, bytes, duration, ports, details
+                 FROM daily_stats
+                 WHERE date BETWEEN ? AND ?
+                 ORDER BY date DESC
+                 LIMIT ?`,
+                fromStr,
+                todayStr,
+                days
+            )
+            .toArray()
+            .map(row => ({
+                date: row.date,
+                ...statsFromStorageRow(row)
+            }));
     }
 
     saveStats(date, stats) {
+        ensureStatsShape(stats);
         this.ctx.storage.sql.exec(
-            `INSERT INTO daily_stats (date, total, success, error, bytes, duration, ports)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            `INSERT INTO daily_stats (date, total, success, error, bytes, duration, ports, details)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(date) DO UPDATE SET
                 total = excluded.total,
                 success = excluded.success,
                 error = excluded.error,
                 bytes = excluded.bytes,
                 duration = excluded.duration,
-                ports = excluded.ports`,
+                ports = excluded.ports,
+                details = excluded.details`,
             date,
             stats.total,
             stats.success,
             stats.error,
             stats.bytes,
             stats.duration,
-            JSON.stringify(stats.ports)
+            JSON.stringify(stats.ports),
+            JSON.stringify(stats)
         );
     }
 
@@ -1449,37 +1772,52 @@ async function handleStatsAPI(request, env) {
         return new Response(JSON.stringify({ error: '未授权' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
 
-    let todayStats = createEmptyStats();
-    let history = [];
-    let loadedFromDurableObject = false;
+    const backendsPromise = getBackendConfig(env);
 
     if (env && env.STATS_DO) {
         try {
-            const id = env.STATS_DO.idFromName('global-stats');
-            const stub = env.STATS_DO.get(id);
-            const res = await stub.fetch('https://stats.local/summary?days=7');
+            const stub = getStatsDoStub(env);
+            const [backends, res] = await Promise.all([
+                backendsPromise,
+                stub.fetch('https://stats.local/summary?days=7')
+            ]);
             const data = await res.json();
-            todayStats = data.today || todayStats;
-            history = data.history || [];
-            loadedFromDurableObject = true;
+
+            return new Response(JSON.stringify({
+                today: data.today || createEmptyStats(),
+                history: data.history || [],
+                backends: backends,
+                kvWarning: !hasKV,
+                statsSource: 'durable_object'
+            }), { headers: { 'Content-Type': 'application/json' } });
         } catch (e) {
+            const backends = await backendsPromise.catch(() => DEFAULT_BACKENDS);
             console.error('Durable Object stats read error:', e.message);
+            return new Response(JSON.stringify({
+                error: '统计服务暂时不可用',
+                details: e.message,
+                today: createEmptyStats(),
+                history: [],
+                backends: backends,
+                kvWarning: !hasKV,
+                statsSource: 'durable_object_error'
+            }), { status: 503, headers: { 'Content-Type': 'application/json' } });
         }
     }
 
-    if (!loadedFromDurableObject) {
-        const today = new Date().toISOString().split('T')[0];
-        todayStats = hasKV ? (await env.EMBY_KV.get(`stats:${today}`, { type: 'json' }) || createEmptyStats()) : createEmptyStats();
-        history = hasKV ? await getStatsSummary(env, 7) : [];
-    }
-
-    const backends = await getBackendConfig(env);
+    const today = new Date().toISOString().split('T')[0];
+    const [backends, todayStats, history] = await Promise.all([
+        backendsPromise,
+        hasKV ? env.EMBY_KV.get(`stats:${today}`, { type: 'json' }).then(stats => stats || createEmptyStats()) : createEmptyStats(),
+        hasKV ? getStatsSummary(env, 7) : []
+    ]);
 
     return new Response(JSON.stringify({
         today: todayStats,
         history: history,
         backends: backends,
-        kvWarning: !hasKV
+        kvWarning: !hasKV,
+        statsSource: 'kv'
     }), { headers: { 'Content-Type': 'application/json' } });
 }
 
@@ -1651,6 +1989,18 @@ async function handleProxy(request, env, ctx) {
     }
 
     const targetUrl = new URL(targetUrlStr);
+    const requestId = crypto.randomUUID();
+    const rangeHeader = request.headers.get('Range') || '';
+    proxyDebug('request', {
+        requestId,
+        method: request.method,
+        port: portKey,
+        path: url.pathname,
+        targetHost: targetUrl.host,
+        range: rangeHeader,
+        userAgent: request.headers.get('User-Agent') || ''
+    });
+
     const newHeaders = new Headers(request.headers);
     newHeaders.set("Host", targetUrl.host);
     newHeaders.delete("cf-connecting-ip");
@@ -1664,12 +2014,29 @@ async function handleProxy(request, env, ctx) {
         const modifiedRequest = new Request(targetUrl, {
             method: request.method,
             headers: newHeaders,
-            body: (request.method !== 'GET' && request.method !== 'HEAD') ? await request.clone().arrayBuffer() : null,
+            body: (request.method !== 'GET' && request.method !== 'HEAD') ? request.body : null,
+            duplex: 'half',
             redirect: 'manual'
         });
 
         const response = await fetch(modifiedRequest);
         const responseHeaders = new Headers(response.headers);
+        const responseContentType = responseHeaders.get('Content-Type') || '';
+        const statsMeta = {
+            statusCode: response.status,
+            hasRange: Boolean(rangeHeader),
+            isPartialContent: response.status === 206,
+            isMedia: isMediaResponse(url.pathname, responseContentType)
+        };
+        proxyDebug('response', {
+            requestId,
+            status: response.status,
+            port: portKey,
+            contentType: responseHeaders.get('Content-Type') || '',
+            contentLength: responseHeaders.get('Content-Length') || '',
+            contentRange: responseHeaders.get('Content-Range') || '',
+            acceptRanges: responseHeaders.get('Accept-Ranges') || ''
+        });
 
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = responseHeaders.get('Location');
@@ -1683,7 +2050,15 @@ async function handleProxy(request, env, ctx) {
 
         if (!response.body) {
             const duration = Date.now() - startTime;
-            await recordStats(env, portKey, response.ok, 0, duration);
+            proxyDebug('stats', {
+                requestId,
+                port: portKey,
+                bytes: 0,
+                duration,
+                countRequest: true,
+                final: true
+            });
+            await recordStats(env, portKey, response.ok, 0, duration, true, statsMeta);
 
             return new Response(null, {
                 status: response.status,
@@ -1692,14 +2067,67 @@ async function handleProxy(request, env, ctx) {
             });
         }
 
-        const reader = response.body.getReader();
-        let responseBytes = 0;
-        let statsRecorded = false;
-        const recordFinalStats = () => {
-            if (statsRecorded) return;
-            statsRecorded = true;
+        const shouldPassThroughBody = request.method === 'GET' && (
+            Boolean(rangeHeader) ||
+            statsMeta.isPartialContent ||
+            statsMeta.isMedia
+        );
+
+        if (shouldPassThroughBody) {
             const duration = Date.now() - startTime;
-            const statsPromise = recordStats(env, portKey, response.ok, responseBytes, duration);
+            const bytes = getPassthroughStatsBytes(rangeHeader, responseHeaders);
+            const byteSource = getPassthroughByteSource(rangeHeader, bytes);
+            const unmeteredBytesHint = bytes > 0 ? 0 : parseContentRangeBytes(responseHeaders.get('Content-Range')) || parseContentLength(responseHeaders);
+            const passthroughMeta = {
+                ...statsMeta,
+                isUnmeteredPassthrough: bytes === 0,
+                unmeteredBytesHint
+            };
+            proxyDebug('stats', {
+                requestId,
+                port: portKey,
+                bytes,
+                unmeteredBytesHint,
+                duration,
+                countRequest: true,
+                final: true,
+                passthrough: true,
+                byteSource
+            });
+            const statsPromise = recordStats(env, portKey, response.ok, bytes, duration, true, passthroughMeta);
+            if (ctx && typeof ctx.waitUntil === 'function') {
+                ctx.waitUntil(statsPromise);
+            } else {
+                await statsPromise;
+            }
+
+            return new Response(response.body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: responseHeaders
+            });
+        }
+
+        const reader = response.body.getReader();
+        let pendingBytes = 0;
+        let requestRecorded = false;
+        let lastStatsFlush = Date.now();
+        const flushStats = (force = false) => {
+            if (pendingBytes <= 0 && (requestRecorded || !force)) return;
+            const now = Date.now();
+            const countRequest = !requestRecorded;
+            requestRecorded = true;
+            proxyDebug('stats', {
+                requestId,
+                port: portKey,
+                bytes: pendingBytes,
+                duration: now - startTime,
+                countRequest,
+                final: force
+            });
+            const statsPromise = recordStats(env, portKey, response.ok, pendingBytes, now - startTime, countRequest, statsMeta);
+            pendingBytes = 0;
+            lastStatsFlush = now;
             if (ctx && typeof ctx.waitUntil === 'function') {
                 ctx.waitUntil(statsPromise);
             }
@@ -1709,15 +2137,20 @@ async function handleProxy(request, env, ctx) {
             async pull(controller) {
                 const { done, value } = await reader.read();
                 if (done) {
-                    recordFinalStats();
+                    flushStats(true);
                     controller.close();
                     return;
                 }
-                responseBytes += value.byteLength || 0;
+                const chunkBytes = value.byteLength || 0;
+                pendingBytes += chunkBytes;
+                const now = Date.now();
+                if (pendingBytes >= STATS_STREAM_FLUSH_BYTES || now - lastStatsFlush >= STATS_STREAM_FLUSH_INTERVAL) {
+                    flushStats();
+                }
                 controller.enqueue(value);
             },
             async cancel(reason) {
-                recordFinalStats();
+                flushStats(true);
                 await reader.cancel(reason);
             }
         });
@@ -1730,8 +2163,20 @@ async function handleProxy(request, env, ctx) {
 
     } catch (err) {
         const duration = Date.now() - startTime;
-        await recordStats(env, portKey, false, 0, duration);
-        await logError(env, portKey, err.message, url.pathname + url.search, clientIP);
+        proxyDebug('error', {
+            requestId,
+            port: portKey,
+            path: url.pathname,
+            duration,
+            error: err.message
+        });
+        const errorStatsPromise = recordStats(env, portKey, false, 0, duration, true, { statusCode: 502, hasRange: Boolean(rangeHeader), isPartialContent: false, isMedia: isMediaResponse(url.pathname, '') });
+        const errorLogPromise = logError(env, portKey, err.message, sanitizeLogUrl(url.pathname + url.search), clientIP);
+        if (ctx && typeof ctx.waitUntil === 'function') {
+            ctx.waitUntil(Promise.all([errorStatsPromise, errorLogPromise]));
+        } else {
+            await Promise.all([errorStatsPromise, errorLogPromise]);
+        }
 
         return new Response("Worker Proxy Error: " + err.message, { status: 502 });
     }
@@ -1780,6 +2225,8 @@ async function handleRequest(request, env, ctx) {
 }
 
 // 事件监听器 - ES Modules 格式
+export { statsFromStorageRow };
+
 export default {
     async fetch(request, env, ctx) {
         return handleRequest(request, env, ctx);
