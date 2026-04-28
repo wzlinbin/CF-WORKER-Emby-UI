@@ -4,7 +4,7 @@ compatibility_date = "2026-04-27"
 
 [[kv_namespaces]]
 binding = "EMBY_KV"
-id = "9fdcf76a9e9945bca94f408d933595a1"
+id = "426c619d565f47d987507dbcdad510d2"
 
 [[durable_objects.bindings]]
 name = "STATS_DO"

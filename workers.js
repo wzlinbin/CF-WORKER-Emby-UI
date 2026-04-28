@@ -61,7 +61,7 @@ const STATS_SAVE_INTERVAL = 30000;
 const STATS_STREAM_FLUSH_BYTES = 8 * 1024 * 1024;
 const STATS_STREAM_FLUSH_INTERVAL = 10000;
 const STATS_OPEN_RANGE_COUNT_LIMIT = 16 * 1024 * 1024;
-const PROXY_DEBUG_LOGS = true;
+const PROXY_DEBUG_LOGS = false;
 
 function getStatsDoStub(env) {
     if (!env || !env.STATS_DO) return null;
